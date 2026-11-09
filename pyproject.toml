@@ -14,7 +14,7 @@ dependencies = [
     "psycopg[binary]>=3.2.3",
     "python-multipart>=0.0.20",
     "httpx>=0.28.1",
-    "forwarded-auth[fastapi] @ git+https://github.com/exowatt-oss/forwarded-auth@2a3463c4ed4da46591f4c0ec930bb3483e12dafd",
+    "forwarded-auth[fastapi] @ git+https://github.com/exowatt-oss/forwarded-auth@58fd85f8ee6624c430aa23c3947d62f8840e5a52",
 ]
 
 [dependency-groups]

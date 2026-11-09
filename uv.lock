@@ -216,7 +216,7 @@ wheels = [
 [[package]]
 name = "forwarded-auth"
 version = "0.1.1"
-source = { git = "https://github.com/exowatt-oss/forwarded-auth?rev=2a3463c4ed4da46591f4c0ec930bb3483e12dafd#2a3463c4ed4da46591f4c0ec930bb3483e12dafd" }
+source = { git = "https://github.com/exowatt-oss/forwarded-auth?rev=58fd85f8ee6624c430aa23c3947d62f8840e5a52#58fd85f8ee6624c430aa23c3947d62f8840e5a52" }
 dependencies = [
     { name = "pyjwt", extra = ["crypto"] },
 ]
@@ -825,7 +825,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "fastapi", specifier = ">=0.139.0" },
-    { name = "forwarded-auth", extras = ["fastapi"], git = "https://github.com/exowatt-oss/forwarded-auth?rev=2a3463c4ed4da46591f4c0ec930bb3483e12dafd" },
+    { name = "forwarded-auth", extras = ["fastapi"], git = "https://github.com/exowatt-oss/forwarded-auth?rev=58fd85f8ee6624c430aa23c3947d62f8840e5a52" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2.3" },
