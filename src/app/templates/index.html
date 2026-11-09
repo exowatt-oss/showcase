@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Showcase — self-hosted HTML and decks</title>
+  <style>
+    :root {font: 16px/1.5 system-ui,sans-serif;color:#172238;background:#f6f8fb}
+    body {max-width:56rem;margin:4rem auto;padding:0 1rem}
+    h1 {font-size:2.5rem;margin-bottom:.25rem}
+    p {color:#44556e}
+    main {background:#fff;border:1px solid #e2e8f0;border-radius:.75rem;padding:2rem}
+    input,button {font:inherit;padding:.55rem .7rem;border:1px solid #bcc8da;border-radius:.4rem}
+    button {background:#315ab0;color:#fff;border-color:#315ab0;cursor:pointer}
+    label {display:block;margin:.75rem 0}
+    .error {color:#a12132}
+    li {padding:.3rem 0}
+  </style>
+</head>
+<body>
+  <main>
+    <h1>Showcase</h1>
+    <p>Drop a self-contained HTML page, get a stable slug URL. Publish versioned deck bundles with <code>scripts/showcase-deck</code>.</p>
+    <p>Uploads require verified authentication at the proxy or a configured OIDC bearer token, plus your private owner token. Pages are public on this host: do not upload confidential material.</p>
+    <form id="upload">
+      <label>HTML page <input type="file" name="file" accept=".html,.htm,text/html" required></label>
+      <label>Slug (optional) <input name="slug" pattern="[a-z0-9-]+" placeholder="my-report"></label>
+      <button>Publish</button>
+    </form>
+    <p id="status" role="status"></p>
+    <h2>Hosted pages and decks</h2>
+    <ul id="library"></ul>
+  </main>
+  <script>
+    const tokenKey = 'showcase_owner_token';
+    let token = localStorage.getItem(tokenKey);
+    if (!token) { token = crypto.randomUUID(); localStorage.setItem(tokenKey, token); }
+    const status = document.getElementById('status');
+    async function catalog() {
+      const response = await fetch('/api/library');
+      if (!response.ok) return;
+      const list = document.getElementById('library');
+      list.replaceChildren();
+      for (const item of (await response.json()).items) {
+        const li = document.createElement('li');
+        const link = document.createElement('a');
+        link.href = '/' + encodeURIComponent(item.slug);
+        link.textContent = item.title || item.slug;
+        li.append(link, document.createTextNode(' · ' + item.kind));
+        list.append(li);
+      }
+    }
+    document.getElementById('upload').addEventListener('submit', async event => {
+      event.preventDefault();
+      status.textContent = 'Uploading…';
+      const response = await fetch('/api/presentations', {
+        method: 'POST', headers: {'X-Owner-Token': token}, body: new FormData(event.target)
+      });
+      const result = await response.json();
+      if (response.ok) {
+        const link = document.createElement('a');
+        link.href = result.path;
+        link.textContent = result.path;
+        status.replaceChildren('Published at ', link);
+        catalog();
+      } else {
+        status.className = 'error';
+        status.textContent = result.detail || 'Upload failed. Configure authentication first.';
+      }
+    });
+    catalog();
+  </script>
+</body>
+</html>

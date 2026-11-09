@@ -1,0 +1,10 @@
+Showcase
+Copyright 2026 Exowatt, Inc.
+
+This project includes optional psycopg and psycopg-binary dependencies licensed
+under LGPL-3.0-only. These are installed dynamically through the Python
+package manager; their original license and source are at https://www.psycopg.org/.
+
+The Preact viewer is installed from npm for builds. See runtime/package-lock.json
+for package versions and licenses; generated runtime JavaScript embeds Preact
+code under the MIT license; its full terms are in THIRD_PARTY_LICENSES.md.

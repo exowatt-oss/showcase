@@ -1,0 +1,17 @@
+{
+  "name": "showcase-deck-runtime",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Viewer runtime for Showcase deck bundles (Preact + esbuild). Built output is committed to src/app/static/runtime/.",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "check": "node build.mjs --check"
+  },
+  "dependencies": {
+    "preact": "11.2.0"
+  },
+  "devDependencies": {
+    "esbuild": "0.28.2"
+  }
+}

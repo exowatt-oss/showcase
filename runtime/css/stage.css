@@ -1,0 +1,95 @@
+/* Showcase deck runtime · stage.css — stage mechanics only (no look).
+   A fixed 1920 × 1080 stage, letterboxed with --stage-scale / --stage-x / --stage-y on <html>.
+   Every rule that also exists in the legacy design/system.css uses the same selector and the
+   same computed value, so a legacy deck (theme "none") that ships its own copy renders the same
+   whichever stylesheet comes last. Rules the legacy file lacks (backup v-move, notes) only touch
+   classes the legacy stage never sets. */
+
+html, body { margin: 0; padding: 0; }
+body { background: #050404; }
+.stage {
+  position: fixed;
+  inset: 0;
+  overflow: hidden;
+  background: #050404;
+}
+
+/* the fixed-size box: clips its own light and keeps print at one page per slide */
+.slide {
+  box-sizing: border-box;
+  position: relative;
+  width: 1920px;
+  height: 1080px;
+  overflow: hidden;
+  contain: strict;
+}
+
+/* speaker notes stay in the markup for the presenter; never on stage */
+.slide > aside.notes { display: none !important; }
+
+/* slide-to-slide crossfade inside the stage */
+.stage .slide { transition: opacity 700ms cubic-bezier(.65, 0, .35, 1), visibility 0s linear 700ms; }
+.stage .slide.is-current { transition: opacity 700ms cubic-bezier(.65, 0, .35, 1), visibility 0s linear 0s; }
+
+.stage .slide {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform-origin: 0 0;
+  transform: translate(var(--stage-x, 0px), var(--stage-y, 0px)) scale(var(--stage-scale, 1));
+  opacity: 0;
+  visibility: hidden;
+}
+.stage .slide.is-current { opacity: 1; visibility: visible; }
+.is-pending .stage .slide.is-current { opacity: 0; }   /* until the fonts are ready */
+
+/* backup slides: ↓ / ↑ moves the stage vertically. `translate` composes with the letterbox
+   transform, so the distance is scaled to stay 64 stage px at any viewport. */
+.stage .slide.v-in-down { animation: exo-v-in-down 700ms cubic-bezier(.16, 1, .3, 1) both; }
+.stage .slide.v-out-down { animation: exo-v-out-down 700ms cubic-bezier(.16, 1, .3, 1) both; }
+.stage .slide.v-in-up { animation: exo-v-in-up 700ms cubic-bezier(.16, 1, .3, 1) both; }
+.stage .slide.v-out-up { animation: exo-v-out-up 700ms cubic-bezier(.16, 1, .3, 1) both; }
+@keyframes exo-v-in-down { from { translate: 0 calc(64px * var(--stage-scale, 1)); } to { translate: 0 0; } }
+@keyframes exo-v-out-down { from { translate: 0 0; } to { translate: 0 calc(-64px * var(--stage-scale, 1)); } }
+@keyframes exo-v-in-up { from { translate: 0 calc(-64px * var(--stage-scale, 1)); } to { translate: 0 0; } }
+@keyframes exo-v-out-up { from { translate: 0 0; } to { translate: 0 calc(64px * var(--stage-scale, 1)); } }
+.no-motion .stage .slide { animation: none !important; }
+@media (prefers-reduced-motion: reduce) {
+  .stage .slide { animation: none !important; }
+}
+
+/* reduced motion, ?static and ?print: every slide shows its end state, immediately */
+@media (prefers-reduced-motion: reduce) {
+  .slide *, .slide *::before, .slide *::after { animation: none !important; transition: none !important; }
+}
+.no-motion .slide *, .no-motion .slide *::before, .no-motion .slide *::after { animation: none !important; transition: none !important; }
+
+/* ---------------------------------------------------------------- print / ?print */
+@page { size: 1920px 1080px; margin: 0; }
+.is-print body, .is-print { background: #050404; }
+.is-print .stage { position: static; overflow: visible; background: none; }
+.is-print .stage .slide {
+  position: relative;
+  transform: none;
+  opacity: 1;
+  visibility: visible;
+  margin: 0 auto;
+  break-inside: avoid;
+}
+.is-print .stage .slide + .slide { break-before: page; page-break-before: always; }
+.is-print .slide *, .is-print .slide *::before, .is-print .slide *::after { animation: none !important; transition: none !important; }
+@media print {
+  html, body { background: none !important; width: 1920px; height: auto !important; }
+  .stage { position: static !important; overflow: visible !important; background: none !important; }
+  .stage .slide {
+    position: relative !important;
+    transform: none !important;
+    opacity: 1 !important;
+    visibility: visible !important;
+    break-inside: avoid;
+    -webkit-print-color-adjust: exact;
+    print-color-adjust: exact;
+  }
+  .stage .slide + .slide { break-before: page; page-break-before: always; }
+  .slide *, .slide *::before, .slide *::after { animation: none !important; transition: none !important; }
+}

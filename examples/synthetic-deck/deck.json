@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "title": "Example deck",
+  "theme": "neutral",
+  "slides": [
+    {"id": "intro", "layout": "title", "title": "Hello, world", "subtitle": "A synthetic deck with no external media"},
+    {"id": "summary", "layout": "statement", "title": "Build something useful", "body": "Replace these slides with your own words."}
+  ]
+}

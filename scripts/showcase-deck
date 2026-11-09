@@ -1,0 +1,2468 @@
+#!/usr/bin/env python3
+"""Make, check, publish and import Showcase deck bundles.
+
+A deck bundle is a folder with a ``deck.json`` plus the files it references
+(see README.md and the synthetic bundle example). This one-file CLI uses
+the Python standard library only.
+
+    showcase-deck init DIR [--title T]          scaffold a new bundle
+    showcase-deck validate DIR                  check it the way the server does
+    showcase-deck preview DIR                   write DIR/.preview/index.html
+    showcase-deck push DIR --slug S [-m MSG]    upload changed files, publish a version
+    showcase-deck versions SLUG                 list published versions
+    showcase-deck pull SLUG DIR [--version N]   download a version into a folder
+    showcase-deck diff SLUG A B                 compare two versions
+    showcase-deck import SRC OUTDIR             convert a legacy single-file HTML deck
+
+Environment:
+    SHOWCASE_URL               base URL (default http://127.0.0.1:8000)
+    SHOWCASE_AUTH_TOKEN        verified OIDC bearer token for API writes (unless behind auth proxy)
+    SHOWCASE_OWNER_TOKEN       owner/workspace token; overrides the token file
+    SHOWCASE_OWNER_TOKEN_FILE  token file (default ~/.config/showcase/owner-token)
+
+The owner token is never printed, logged or put in an error message.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import binascii
+import difflib
+import hashlib
+import html as html_lib
+import json
+import os
+import re
+import secrets
+import shutil
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+DEFAULT_SHOWCASE_URL = "http://127.0.0.1:8000"
+USER_AGENT = "showcase-deck/1"
+MAX_FILE_BYTES = 64 * 1024 * 1024
+MAX_PATH_LEN = 200
+MAX_SLIDES = 200
+MAX_TITLE = 300
+
+PATH_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
+SLIDE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
+FLAG_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+SHA_RE = re.compile(r"^[0-9a-f]{64}$")
+# A bundle path inside text is only a reference when it is not glued to a
+# longer path or word (contract: "not preceded by [A-Za-z0-9_./-]").
+REF_BOUNDARY = r"(?<![A-Za-z0-9_./-])"
+
+THEMES = ("neutral", "none")
+TONES = ("dark", "light", "paper", "bright", "dusk")
+VIDEO_EXTS = (".mp4", ".webm", ".mov")
+
+MIME_BY_EXT = {
+    ".html": "text/html; charset=utf-8",
+    ".htm": "text/html; charset=utf-8",
+    ".css": "text/css; charset=utf-8",
+    ".js": "text/javascript; charset=utf-8",
+    ".mjs": "text/javascript; charset=utf-8",
+    ".json": "application/json",
+    ".txt": "text/plain; charset=utf-8",
+    ".md": "text/markdown; charset=utf-8",
+    ".svg": "image/svg+xml",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+    ".avif": "image/avif",
+    ".ico": "image/x-icon",
+    ".mp4": "video/mp4",
+    ".webm": "video/webm",
+    ".mov": "video/quicktime",
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".ogg": "audio/ogg",
+    ".m4a": "audio/mp4",
+    ".woff2": "font/woff2",
+    ".woff": "font/woff",
+    ".ttf": "font/ttf",
+    ".otf": "font/otf",
+    ".pdf": "application/pdf",
+    ".csv": "text/csv; charset=utf-8",
+    ".glb": "model/gltf-binary",
+    ".gltf": "model/gltf+json",
+    ".wasm": "application/wasm",
+}
+TEXT_EXTS = (".html", ".htm", ".css", ".js", ".mjs", ".json", ".svg", ".txt", ".md", ".csv")
+
+EXT_BY_MIME = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/jpg": "jpg",
+    "image/pjpeg": "jpg",
+    "image/gif": "gif",
+    "image/webp": "webp",
+    "image/avif": "avif",
+    "image/svg+xml": "svg",
+    "image/x-icon": "ico",
+    "image/vnd.microsoft.icon": "ico",
+    "image/bmp": "bmp",
+    "video/mp4": "mp4",
+    "video/webm": "webm",
+    "video/quicktime": "mov",
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/wav": "wav",
+    "audio/ogg": "ogg",
+    "audio/mp4": "m4a",
+    "font/woff2": "woff2",
+    "font/woff": "woff",
+    "font/ttf": "ttf",
+    "font/otf": "otf",
+    "application/font-woff2": "woff2",
+    "application/font-woff": "woff",
+    "application/x-font-woff": "woff",
+    "application/x-font-ttf": "ttf",
+    "application/x-font-opentype": "otf",
+    "application/vnd.ms-fontobject": "eot",
+    "application/pdf": "pdf",
+    "application/json": "json",
+    "text/css": "css",
+    "text/javascript": "js",
+    "application/javascript": "js",
+    "text/plain": "txt",
+    "text/html": "html",
+    "text/csv": "csv",
+    "model/gltf-binary": "glb",
+    "application/wasm": "wasm",
+}
+
+TEXT_FIELDS = ("title", "kicker", "subtitle", "body", "caption", "quote", "by")
+
+# layout -> (required props, optional props). Common slide keys are separate.
+LAYOUTS = {
+    "title": (("title",), ("kicker", "subtitle", "media")),
+    "statement": (("title",), ("kicker", "body")),
+    "hero-media": (("title", "media"), ("kicker", "body", "side")),
+    "split": (("title", "media"), ("kicker", "body", "side")),
+    "stats": (("title", "stats"), ("kicker", "body", "media")),
+    "steps": (("title", "steps"), ("kicker",)),
+    "gallery": (("items",), ("title", "kicker")),
+    "quote": (("quote",), ("by", "media")),
+    "media": (("media",), ("caption",)),
+    "close": (("title",), ("points", "kicker", "media")),
+    "html": (("html",), ()),
+}
+COMMON_SLIDE_KEYS = ("id", "layout", "notes", "backup", "when", "tone", "fine")
+TOP_LEVEL_KEYS = ("schema", "title", "theme", "css", "scripts", "flags", "fine", "slides")
+
+
+class CliError(Exception):
+    """A user-facing failure; main() prints it and exits 1."""
+
+
+def say(message: str = "") -> None:
+    print(message, flush=True)
+
+
+def warn(message: str) -> None:
+    print(f"showcase-deck: warning: {message}", file=sys.stderr, flush=True)
+
+
+def human_mb(size: int) -> str:
+    """Decimal units (1 MB = 1,000,000 bytes), like the sizes people quote."""
+    if size < 1_000_000:
+        return f"{size / 1000:.1f} KB"
+    return f"{size / 1_000_000:.2f} MB"
+
+
+# --------------------------------------------------------------------------- bundle files
+
+
+def path_problem(path: str) -> str | None:
+    """Return why ``path`` is not a legal bundle path, or None."""
+    if not isinstance(path, str) or not path:
+        return "must be a non-empty string"
+    if len(path) > MAX_PATH_LEN:
+        return f"is longer than {MAX_PATH_LEN} characters"
+    if not PATH_RE.match(path):
+        return "may only contain A-Z a-z 0-9 . _ / -"
+    if path.startswith("/"):
+        return "must be relative to the deck folder (no leading /)"
+    parts = path.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        return "must not contain empty, '.' or '..' segments"
+    if any(part.startswith(".") for part in parts):
+        return "must not name a dot-file (dot-files are not part of the bundle)"
+    return None
+
+
+def scan_bundle(root: Path) -> tuple[dict[str, Path], list[str]]:
+    """Map every bundle file (POSIX relative path) to its location.
+
+    Dot-files and dot-directories (``.preview``, ``.DS_Store``, ``.git``) are
+    skipped. Returns (files, problems) where problems are illegal names.
+    """
+    files: dict[str, Path] = {}
+    problems: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = sorted(d for d in dirnames if not d.startswith("."))
+        for name in sorted(filenames):
+            if name.startswith("."):
+                continue
+            full = Path(dirpath) / name
+            rel = full.relative_to(root).as_posix()
+            if full.is_symlink():
+                problems.append(f"{rel}: symlinks are not allowed in a bundle")
+                continue
+            if not full.is_file():
+                continue
+            problem = path_problem(rel)
+            if problem:
+                problems.append(f"{rel}: file name {problem}")
+                continue
+            files[rel] = full
+    return files, problems
+
+
+def mime_for(path: str) -> str:
+    return MIME_BY_EXT.get(Path(path).suffix.lower(), "application/octet-stream")
+
+
+def ext_of(path: str) -> str:
+    suffix = Path(path).suffix.lower().lstrip(".")
+    return suffix if suffix and re.match(r"^[a-z0-9]{1,10}$", suffix) else "bin"
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8")
+
+
+def ref_pattern(paths) -> re.Pattern | None:
+    """Regex matching any of ``paths`` at a reference boundary (longest first)."""
+    ordered = sorted(set(paths), key=len, reverse=True)
+    if not ordered:
+        return None
+    return re.compile(REF_BOUNDARY + "(" + "|".join(re.escape(p) for p in ordered) + ")")
+
+
+def rewrite_refs(text: str, mapping: dict[str, str]) -> str:
+    """Replace bundle-path references in ``text`` per the contract's rewrite rule."""
+    pattern = ref_pattern(mapping)
+    if pattern is None:
+        return text
+    return pattern.sub(lambda m: mapping[m.group(1)], text)
+
+
+def rewrite_value(value, mapping: dict[str, str]):
+    """rewrite_refs applied to every string inside a JSON value."""
+    if isinstance(value, str):
+        return rewrite_refs(value, mapping)
+    if isinstance(value, list):
+        return [rewrite_value(item, mapping) for item in value]
+    if isinstance(value, dict):
+        return {key: rewrite_value(item, mapping) for key, item in value.items()}
+    return value
+
+
+LOOSE_REF_RE = re.compile(
+    REF_BOUNDARY + r"((?:assets|media|img|images|video|fonts)/[A-Za-z0-9._/-]*[A-Za-z0-9_-]"
+    r"\.[A-Za-z0-9]{1,8})"
+)
+
+
+# --------------------------------------------------------------------------- HTML scanning
+
+# Elements whose content is raw text: a "<section" inside them is not markup.
+RAW_TEXT_ELEMENTS = ("script", "style", "textarea", "title", "xmp")
+TAG_RE = re.compile(
+    r"<!--|<(/?)([A-Za-z][A-Za-z0-9-]*)((?:[^>\"']|\"[^\"]*\"|'[^']*')*)>",
+    re.S,
+)
+ATTR_RE = re.compile(
+    r"([^\s\"'>/=]+)(?:\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s\"'>]+))?",
+    re.S,
+)
+
+
+class Tag:
+    """One tag found by iter_tags. Raw-text elements carry their content span."""
+
+    __slots__ = ("name", "closing", "start", "end", "attrs_text", "inner")
+
+    def __init__(self, name, closing, start, end, attrs_text, inner=None):
+        self.name = name
+        self.closing = closing
+        self.start = start  # index of '<'
+        self.end = end  # index after '>' (after the closing tag for raw-text elements)
+        self.attrs_text = attrs_text
+        self.inner = inner  # (start, end) of raw-text content, or None
+
+    def attrs(self) -> dict[str, str]:
+        return parse_attrs(self.attrs_text)
+
+
+def parse_attrs(text: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for m in ATTR_RE.finditer(text or ""):
+        name = m.group(1).lower()
+        raw = m.group(2)
+        if raw is None:
+            value = ""
+        elif raw[:1] in ("'", '"'):
+            value = raw[1:-1]
+        else:
+            value = raw
+        out.setdefault(name, html_lib.unescape(value))
+    return out
+
+
+def iter_tags(text: str, start: int = 0, end: int | None = None):
+    """Yield the tags of ``text`` in order, skipping comments and raw-text content.
+
+    A raw-text element (script, style, …) is yielded once, as an opening Tag whose
+    ``end`` is after its closing tag and whose ``inner`` is the content span.
+    """
+    limit = len(text) if end is None else end
+    pos = start
+    while pos < limit:
+        m = TAG_RE.search(text, pos, limit)
+        if not m:
+            return
+        if m.group(0) == "<!--":
+            close = text.find("-->", m.end(), limit)
+            pos = limit if close < 0 else close + 3
+            continue
+        closing = m.group(1) == "/"
+        name = m.group(2).lower()
+        if not closing and name in RAW_TEXT_ELEMENTS:
+            close_re = re.compile(r"</" + name + r"\s*>", re.I)
+            cm = close_re.search(text, m.end(), limit)
+            inner_end = cm.start() if cm else limit
+            tag_end = cm.end() if cm else limit
+            yield Tag(name, False, m.start(), tag_end, m.group(3), (m.end(), inner_end))
+            pos = tag_end
+            continue
+        yield Tag(name, closing, m.start(), m.end(), m.group(3))
+        pos = m.end()
+
+
+def has_class(attrs: dict[str, str], cls: str) -> bool:
+    return cls in (attrs.get("class") or "").split()
+
+
+def find_slide_sections(text: str) -> list[tuple[int, int, Tag]]:
+    """Top-level ``<section class="slide …">`` elements as (start, end, open_tag).
+
+    Nested sections are matched by depth; ``<section`` inside script/style text and
+    comments is ignored.
+    """
+    found = []
+    depth = 0
+    opener = None
+    for tag in iter_tags(text):
+        if tag.name != "section":
+            continue
+        if not tag.closing:
+            if depth == 0:
+                if has_class(tag.attrs(), "slide"):
+                    opener = tag
+                    depth = 1
+            else:
+                depth += 1
+        elif depth:
+            depth -= 1
+            if depth == 0 and opener is not None:
+                found.append((opener.start, tag.end, opener))
+                opener = None
+    if depth and opener is not None:
+        found.append((opener.start, len(text), opener))
+    return found
+
+
+def set_open_tag_attr(tag_text: str, name: str, value: str) -> str:
+    """Set attribute ``name`` on an opening tag's text (first occurrence wins)."""
+    pattern = re.compile(
+        r"(\s" + re.escape(name) + r"\s*=\s*)(\"[^\"]*\"|'[^']*'|[^\s\"'>]+)", re.I
+    )
+    escaped = html_lib.escape(value, quote=True)
+    if pattern.search(tag_text):
+        return pattern.sub(lambda m: m.group(1) + '"' + escaped + '"', tag_text, count=1)
+    head = re.match(r"<[A-Za-z][A-Za-z0-9-]*", tag_text)
+    cut = head.end() if head else 0
+    return tag_text[:cut] + f' {name}="{escaped}"' + tag_text[cut:]
+
+
+# --------------------------------------------------------------------------- validation
+
+
+class Report:
+    """Collected validation messages."""
+
+    def __init__(self):
+        self.errors: list[str] = []
+        self.warnings: list[str] = []
+
+    def error(self, where: str, message: str) -> None:
+        self.errors.append(f"{where}: {message}" if where else message)
+
+    def warn(self, where: str, message: str) -> None:
+        self.warnings.append(f"{where}: {message}" if where else message)
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+
+def _is_str(value) -> bool:
+    return isinstance(value, str)
+
+
+def _check_text(report: Report, where: str, value, required: bool = False) -> None:
+    if value is None:
+        if required:
+            report.error(where, "is required")
+        return
+    if not _is_str(value):
+        report.error(where, "must be a string (plain text; **bold** and \\n allowed)")
+    elif required and not value.strip():
+        report.error(where, "must not be empty")
+    elif re.search(r"<\s*/?\s*[A-Za-z][^>]*>", value):
+        report.warn(where, "looks like HTML; layout text is plain text (use a layout 'html' slide)")
+
+
+def _check_path(report: Report, where: str, value, paths: set[str], exts=None) -> None:
+    if not _is_str(value):
+        report.error(where, "must be a bundle path string")
+        return
+    problem = path_problem(value)
+    if problem:
+        report.error(where, f"'{value}' {problem}")
+        return
+    if exts and not value.lower().endswith(exts):
+        report.warn(where, f"'{value}' does not end with {' or '.join(exts)}")
+    if value not in paths:
+        report.error(where, f"'{value}' is not a file in the bundle")
+
+
+def _check_media(report: Report, where: str, value, paths: set[str], required: bool) -> None:
+    if value is None:
+        if required:
+            report.error(where, "is required")
+        return
+    if _is_str(value):
+        _check_path(report, where, value, paths)
+        return
+    if not isinstance(value, dict):
+        report.error(where, "must be a bundle path or {src, poster, alt, fit, loop}")
+        return
+    for key in value:
+        if key not in ("src", "poster", "alt", "fit", "loop"):
+            report.warn(f"{where}.{key}", "unknown media key (ignored)")
+    if "src" not in value:
+        report.error(f"{where}.src", "is required")
+    else:
+        _check_path(report, f"{where}.src", value["src"], paths)
+    if "poster" in value:
+        _check_path(report, f"{where}.poster", value["poster"], paths)
+    if "alt" in value and not _is_str(value["alt"]):
+        report.error(f"{where}.alt", "must be a string")
+    if "fit" in value and value["fit"] not in ("cover", "contain"):
+        report.error(f"{where}.fit", "must be 'cover' or 'contain'")
+    if "loop" in value and not isinstance(value["loop"], bool):
+        report.error(f"{where}.loop", "must be true or false")
+
+
+def _check_list(report, where, value, lo, hi, what) -> bool:
+    if not isinstance(value, list):
+        report.error(where, f"must be a list of {lo}–{hi} {what}")
+        return False
+    if not lo <= len(value) <= hi:
+        report.error(where, f"must have {lo}–{hi} {what} (has {len(value)})")
+    return True
+
+
+def _check_html_slide_file(report: Report, where: str, slide_id: str, path: Path) -> None:
+    try:
+        text = read_text(path)
+    except UnicodeDecodeError:
+        report.error(where, "custom slide file must be UTF-8 text")
+        return
+    sections = find_slide_sections(text)
+    if len(sections) != 1:
+        report.error(
+            where,
+            f'must hold exactly one <section class="slide …"> (found {len(sections)})',
+        )
+        return
+    current = sections[0][2].attrs().get("data-slide")
+    if current is not None and current != slide_id:
+        report.warn(where, f"data-slide=\"{current}\" will be forced to the slide id '{slide_id}'")
+
+
+def validate_deck(deck, paths: set[str], root: Path | None = None) -> Report:
+    """Validate a parsed deck.json against the v1 contract.
+
+    ``paths`` are the bundle's file paths; ``root`` (optional) lets custom slide
+    files be inspected.
+    """
+    report = Report()
+    if not isinstance(deck, dict):
+        report.error("deck.json", "must be a JSON object")
+        return report
+    for key in deck:
+        if key not in TOP_LEVEL_KEYS:
+            report.warn(key, "unknown top-level key (ignored)")
+    if deck.get("schema") != 1 or isinstance(deck.get("schema"), bool):
+        report.error("schema", "must be 1")
+    title = deck.get("title")
+    if not _is_str(title) or not title.strip():
+        report.error("title", "is required (a non-empty string)")
+    elif len(title) > MAX_TITLE:
+        report.error("title", f"must be at most {MAX_TITLE} characters")
+    if "theme" in deck and deck["theme"] not in THEMES:
+        report.error("theme", "must be 'neutral' or 'none'")
+    for key, exts in (("css", (".css",)), ("scripts", (".js", ".mjs"))):
+        if key not in deck:
+            continue
+        if not isinstance(deck[key], list):
+            report.error(key, "must be a list of bundle paths")
+            continue
+        for i, item in enumerate(deck[key]):
+            _check_path(report, f"{key}[{i}]", item, paths, exts)
+    flags = deck.get("flags", {})
+    if not isinstance(flags, dict):
+        report.error("flags", "must be an object of name: true/false")
+        flags = {}
+    for name, value in flags.items():
+        if not FLAG_RE.match(name):
+            report.error(f"flags.{name}", "flag names may only use A-Z a-z 0-9 _ -")
+        if not isinstance(value, bool):
+            report.error(f"flags.{name}", "must be true or false")
+    if "fine" in deck and not _is_str(deck["fine"]):
+        report.error("fine", "must be a string")
+
+    slides = deck.get("slides")
+    if not isinstance(slides, list) or not slides:
+        report.error("slides", f"is required: a list of 1–{MAX_SLIDES} slides")
+        return report
+    if len(slides) > MAX_SLIDES:
+        report.error("slides", f"at most {MAX_SLIDES} slides (has {len(slides)})")
+    seen: dict[str, int] = {}
+    for index, slide in enumerate(slides):
+        _validate_slide(report, index, slide, paths, flags, seen, root)
+    return report
+
+
+def _validate_slide(report, index, slide, paths, flags, seen, root) -> None:
+    where = f"slides[{index}]"
+    if not isinstance(slide, dict):
+        report.error(where, "must be an object")
+        return
+    slide_id = slide.get("id")
+    if not _is_str(slide_id) or not SLIDE_ID_RE.match(slide_id):
+        report.error(f"{where}.id", "is required: 1–64 of a-z 0-9 -, starting with a letter/digit")
+    else:
+        where = f"slide '{slide_id}' (#{index + 1})"
+        if slide_id in seen:
+            report.error(where, f"duplicate id (also slide #{seen[slide_id] + 1})")
+        else:
+            seen[slide_id] = index
+    layout = slide.get("layout")
+    if layout not in LAYOUTS:
+        report.error(f"{where}.layout", f"must be one of: {', '.join(LAYOUTS)}")
+        return
+    required, optional = LAYOUTS[layout]
+    for key in slide:
+        if key not in COMMON_SLIDE_KEYS and key not in required and key not in optional:
+            report.warn(f"{where}.{key}", f"not a prop of layout '{layout}' (ignored)")
+    if "notes" in slide and not _is_str(slide["notes"]):
+        report.error(f"{where}.notes", "must be a string")
+    if "backup" in slide and not isinstance(slide["backup"], bool):
+        report.error(f"{where}.backup", "must be true or false")
+    if "when" in slide:
+        when = slide["when"]
+        name = when[1:] if _is_str(when) and when.startswith("!") else when
+        if not _is_str(when) or not FLAG_RE.match(name or ""):
+            report.error(f"{where}.when", "must be a flag name or !name")
+        elif name not in flags:
+            report.warn(
+                f"{where}.when",
+                f"flag '{name}' is not declared in top-level flags (it counts as false)",
+            )
+    if "tone" in slide:
+        if layout == "html":
+            report.error(f"{where}.tone", "tone is for layout slides only")
+        elif slide["tone"] not in TONES:
+            report.error(f"{where}.tone", f"must be one of: {', '.join(TONES)}")
+    if "fine" in slide and not (_is_str(slide["fine"]) or slide["fine"] is False):
+        report.error(f"{where}.fine", "must be a string or false")
+
+    for key in TEXT_FIELDS:
+        if key in required or key in optional:
+            _check_text(report, f"{where}.{key}", slide.get(key), required=key in required)
+    if "side" in optional and "side" in slide and slide["side"] not in ("left", "right"):
+        report.error(f"{where}.side", "must be 'left' or 'right'")
+    if "media" in required or "media" in optional:
+        _check_media(report, f"{where}.media", slide.get("media"), paths, "media" in required)
+
+    if layout == "stats":
+        stats = slide.get("stats")
+        if stats is None:
+            report.error(f"{where}.stats", "is required")
+        elif _check_list(report, f"{where}.stats", stats, 1, 4, "stats"):
+            for i, stat in enumerate(stats):
+                w = f"{where}.stats[{i}]"
+                if not isinstance(stat, dict):
+                    report.error(w, "must be {value, label, sub}")
+                    continue
+                _check_text(report, f"{w}.value", stat.get("value"), required=True)
+                _check_text(report, f"{w}.label", stat.get("label"), required=True)
+                _check_text(report, f"{w}.sub", stat.get("sub"))
+    if layout == "steps":
+        steps = slide.get("steps")
+        if steps is None:
+            report.error(f"{where}.steps", "is required")
+        elif _check_list(report, f"{where}.steps", steps, 2, 6, "steps"):
+            for i, step in enumerate(steps):
+                w = f"{where}.steps[{i}]"
+                if not isinstance(step, dict):
+                    report.error(w, "must be {title, body, media}")
+                    continue
+                _check_text(report, f"{w}.title", step.get("title"), required=True)
+                _check_text(report, f"{w}.body", step.get("body"))
+                _check_media(report, f"{w}.media", step.get("media"), paths, False)
+    if layout == "gallery":
+        items = slide.get("items")
+        if items is None:
+            report.error(f"{where}.items", "is required")
+        elif _check_list(report, f"{where}.items", items, 1, 8, "items"):
+            for i, item in enumerate(items):
+                w = f"{where}.items[{i}]"
+                if not isinstance(item, dict):
+                    report.error(w, "must be {media, caption}")
+                    continue
+                _check_media(report, f"{w}.media", item.get("media"), paths, True)
+                _check_text(report, f"{w}.caption", item.get("caption"))
+    if layout == "close" and "points" in slide:
+        points = slide["points"]
+        if _check_list(report, f"{where}.points", points, 0, 4, "points"):
+            for i, point in enumerate(points):
+                if not _is_str(point):
+                    report.error(f"{where}.points[{i}]", "must be a string")
+                else:
+                    _check_text(report, f"{where}.points[{i}]", point)
+    if layout == "html":
+        html_path = slide.get("html")
+        if html_path is None:
+            report.error(f"{where}.html", "is required (bundle path of the slide file)")
+        else:
+            before = len(report.errors)
+            _check_path(report, f"{where}.html", html_path, paths, (".html", ".htm"))
+            if len(report.errors) == before and root is not None and _is_str(slide_id):
+                _check_html_slide_file(report, f"{where} ({html_path})", slide_id, root / html_path)
+
+
+def _scan_text_refs(report: Report, rel: str, text: str, paths: set[str]) -> None:
+    for m in LOOSE_REF_RE.finditer(text):
+        if m.group(1) not in paths:
+            report.warn(rel, f"references '{m.group(1)}', which is not in the bundle")
+    for m in re.finditer(r"data:[A-Za-z0-9.+/-]+(?:;[^,\s\"')]*)?,", text):
+        tail = re.match(r"[A-Za-z0-9+/=%]*", text[m.end() : m.end() + 4096])
+        if tail and len(tail.group(0)) > 2048:
+            report.warn(rel, "embeds a large data: URI; move it to assets/ and reference the path")
+            break
+
+
+def validate_bundle(root: Path, check_text: bool = True):
+    """Validate the bundle folder ``root``. Returns (report, deck, files)."""
+    report = Report()
+    if not root.is_dir():
+        report.error(str(root), "is not a folder")
+        return report, None, {}
+    files, problems = scan_bundle(root)
+    for problem in problems:
+        report.error("", problem)
+    if "deck.json" not in files:
+        report.error("deck.json", "is missing")
+        return report, None, files
+    try:
+        deck = json.loads(read_text(files["deck.json"]))
+    except (UnicodeDecodeError, ValueError) as exc:
+        report.error("deck.json", f"is not valid JSON: {exc}")
+        return report, None, files
+    for rel, full in files.items():
+        size = full.stat().st_size
+        if size > MAX_FILE_BYTES:
+            report.error(rel, f"is {size / (1024 * 1024):.1f} MiB; the limit is 64 MiB per file")
+    paths = set(files) - {"deck.json"}
+    deck_report = validate_deck(deck, paths, root)
+    report.errors.extend(deck_report.errors)
+    report.warnings.extend(deck_report.warnings)
+    if check_text:
+        for rel, full in files.items():
+            if rel == "deck.json" or not rel.lower().endswith(TEXT_EXTS):
+                continue
+            if full.stat().st_size > MAX_FILE_BYTES:
+                continue
+            try:
+                text = read_text(full)
+            except UnicodeDecodeError:
+                continue
+            _scan_text_refs(report, rel, text, paths)
+    return report, deck, files
+
+
+def print_report(report: Report) -> None:
+    for message in report.warnings:
+        print(f"  warning  {message}", file=sys.stderr)
+    for message in report.errors:
+        print(f"  error    {message}", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------- data: URIs
+
+DATA_HEAD_RE = re.compile(
+    r"data:([A-Za-z0-9.+-]+/[A-Za-z0-9.+-]+)?"
+    r"((?:;[A-Za-z0-9_.+-]+(?:=[^;,\s\"'()<>]*)?)*),",
+)
+B64_PAYLOAD_RE = re.compile(r"[A-Za-z0-9+/=%_-]*")
+
+
+def sniff_ext(data: bytes) -> str | None:
+    """File type from magic bytes (None when unknown)."""
+    head = data[:64]
+    if head.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "png"
+    if head.startswith(b"\xff\xd8\xff"):
+        return "jpg"
+    if head.startswith((b"GIF87a", b"GIF89a")):
+        return "gif"
+    if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+        return "webp"
+    if head[:4] == b"RIFF" and head[8:12] == b"WAVE":
+        return "wav"
+    if head[4:8] == b"ftyp":
+        brand = head[8:12]
+        if brand in (b"avif", b"avis"):
+            return "avif"
+        if brand == b"qt  ":
+            return "mov"
+        if brand in (b"M4A ", b"M4B "):
+            return "m4a"
+        return "mp4"
+    if head.startswith(b"\x1a\x45\xdf\xa3"):
+        return "webm"
+    if head.startswith(b"wOF2"):
+        return "woff2"
+    if head.startswith(b"wOFF"):
+        return "woff"
+    if head.startswith((b"\x00\x01\x00\x00", b"true")):
+        return "ttf"
+    if head.startswith(b"OTTO"):
+        return "otf"
+    if head.startswith(b"%PDF"):
+        return "pdf"
+    if head.startswith(b"ID3") or head[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2"):
+        return "mp3"
+    if head.startswith(b"OggS"):
+        return "ogg"
+    if head.startswith(b"\x00\x00\x01\x00"):
+        return "ico"
+    stripped = data[:2048].lstrip(b"\xef\xbb\xbf \t\r\n")
+    if stripped.startswith(b"<") and b"<svg" in data[:4096]:
+        return "svg"
+    return None
+
+
+SNIFF_FAMILIES = ({"mp4", "mov", "m4a"}, {"jpg"}, {"ttf", "otf"})
+BINARY_EXTS = {
+    "png", "jpg", "gif", "webp", "avif", "mp4", "mov", "webm", "woff2", "woff",
+    "ttf", "otf", "pdf", "mp3", "ogg", "wav", "m4a", "ico",
+}  # fmt: skip
+
+
+class AssetStore:
+    """Content-addressed store for data: URIs pulled out of a legacy deck."""
+
+    def __init__(self):
+        self.by_sha: dict[str, tuple[str, bytes]] = {}  # sha -> (bundle path, data)
+        self.occurrences = 0
+        self.duplicate_bytes = 0
+        self.left_inline: list[str] = []
+        self.notes: list[str] = []
+
+    def add(self, mime: str, data: bytes) -> str:
+        self.occurrences += 1
+        sha = hashlib.sha256(data).hexdigest()
+        if sha in self.by_sha:
+            self.duplicate_bytes += len(data)
+            return self.by_sha[sha][0]
+        declared = EXT_BY_MIME.get((mime or "").lower())
+        sniffed = sniff_ext(data)
+        ext = declared or sniffed or "bin"
+        if declared and sniffed and declared != sniffed:
+            same_family = any(declared in fam and sniffed in fam for fam in SNIFF_FAMILIES)
+            if not same_family:
+                self.notes.append(
+                    f"{sha[:12]}: declared {mime} but the bytes are {sniffed}; saved as .{sniffed}"
+                )
+                ext = sniffed
+        elif declared in BINARY_EXTS and sniffed is None:
+            self.notes.append(f"{sha[:12]}: declared {mime} but the bytes do not look like one")
+        path = f"assets/{sha[:12]}.{ext}"
+        self.by_sha[sha] = (path, data)
+        return path
+
+    @property
+    def total_bytes(self) -> int:
+        return sum(len(data) for _, data in self.by_sha.values())
+
+    def files(self) -> dict[str, bytes]:
+        return {path: data for path, data in self.by_sha.values()}
+
+
+def _decode_base64(payload: str) -> bytes | None:
+    # The legacy builder percent-encodes some letters (e.g. %4F) to dodge a word
+    # filter, so percent-decode before base64-decoding.
+    text = urllib.parse.unquote(payload)
+    text = re.sub(r"\s+", "", text)
+    if "-" in text or "_" in text:
+        text = text.replace("-", "+").replace("_", "/")
+    text = text.rstrip("=")
+    text += "=" * (-len(text) % 4)
+    try:
+        return base64.b64decode(text, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+
+def extract_data_uris(text: str, store: AssetStore, where: str = "") -> str:
+    """Replace every data: URI in ``text`` with a bundle path from ``store``."""
+    out: list[str] = []
+    pos = 0
+    for m in DATA_HEAD_RE.finditer(text):
+        if m.start() < pos:
+            continue
+        mime = m.group(1) or ""
+        params = [p.lower() for p in (m.group(2) or "").split(";") if p]
+        prev = text[m.start() - 1] if m.start() else ""
+        if "base64" in params:
+            payload_m = B64_PAYLOAD_RE.match(text, m.end())
+            payload = payload_m.group(0) if payload_m else ""
+            end = m.end() + len(payload)
+            data = _decode_base64(payload) if payload else None
+        else:
+            closer = {'"': '"', "'": "'", "(": ")"}.get(prev)
+            if not closer:
+                continue
+            end = text.find(closer, m.end())
+            if end < 0:
+                continue
+            payload = text[m.end() : end]
+            if not payload or "\\" in payload or "\n" in payload:
+                if len(payload) > 256:
+                    store.left_inline.append(f"{where}: non-base64 data:{mime} left inline")
+                continue
+            data = urllib.parse.unquote_to_bytes(payload)
+        if not payload:
+            continue  # e.g. "data:image/png;base64," + b64 in JS
+        if data is None:
+            store.left_inline.append(f"{where}: undecodable data:{mime} left inline")
+            continue
+        out.append(text[pos : m.start()])
+        out.append(store.add(mime, data))
+        pos = end
+    out.append(text[pos:])
+    return "".join(out)
+
+
+# --------------------------------------------------------------------------- legacy import
+
+STAGE_JS_MARKERS = ("window.ShowcaseStage =", "window.ShowcaseStage=", "stage.js v")
+SLIDE_REF_RE = re.compile(r"data-slide\s*=\s*\\?[\"']?([A-Za-z0-9_-]+)")
+JS_TYPES = ("", "text/javascript", "application/javascript", "module", "text/ecmascript")
+
+
+def is_stage_js(source: str) -> bool:
+    head = source[:4000]
+    return (
+        "window.ShowcaseStage =" in source
+        or "window.ShowcaseStage=" in source
+        or ("stage.js" in head and "SLIDE" in head.upper())
+    )
+
+
+CSS_PRELUDE_RE = re.compile(r"(?:^|[{};])\s*([^{}@;]+?)\s*\{")
+KEYFRAME_SELECTOR_RE = re.compile(r"^\s*(?:from|to|[\d.]+%)(?:\s*,\s*(?:from|to|[\d.]+%))*\s*$")
+
+
+def split_selector_list(prelude: str) -> list[str]:
+    """Split ``a, b:is(c, d)`` at top-level commas."""
+    parts, depth, current = [], 0, []
+    for ch in prelude:
+        if ch in "([":
+            depth += 1
+        elif ch in ")]" and depth:
+            depth -= 1
+        if ch == "," and depth == 0:
+            parts.append("".join(current))
+            current = []
+        else:
+            current.append(ch)
+    parts.append("".join(current))
+    return [p.strip() for p in parts if p.strip()]
+
+
+def css_single_owner(css: str, known: set[str]) -> str | None:
+    """The one slide every selector in ``css`` is scoped to, else None.
+
+    A style block is only moved into a slide file when *all* its rules target that
+    one slide (``[data-slide="x"]``); anything broader stays deck-level, because a
+    slide file's CSS is only present once that slide is mounted.
+    """
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    owner = None
+    for prelude in CSS_PRELUDE_RE.findall(css):
+        if KEYFRAME_SELECTOR_RE.match(prelude):
+            continue
+        for selector in split_selector_list(prelude):
+            refs = {m.group(1) for m in SLIDE_REF_RE.finditer(selector)} & known
+            if len(refs) != 1:
+                return None
+            (ref,) = refs
+            if owner is not None and owner != ref:
+                return None
+            owner = ref
+    return owner
+
+
+# ---- cascade-order safety
+#
+# A legacy deck's <style> elements cascade in document order. In a bundle they end up in
+# three places, in this order: deck.css (<head>), a slide file's sibling styles (appended to
+# <head> when the slide mounts), and styles inside a slide's <section> (in <body>, with the
+# slide). Moving a block to a later place than a block that followed it in the source can
+# flip the winner of two equally specific rules. plan_style_placement() finds such pairs; the
+# importer then keeps the earlier block in deck.css at its source position instead.
+
+CSS_GROUP_AT_RULES = (
+    "media",
+    "supports",
+    "container",
+    "layer",
+    "document",
+    "scope",
+    "starting-style",
+)
+PROPERTY_ROOT_ALIASES = {
+    "top": "inset",
+    "right": "inset",
+    "bottom": "inset",
+    "left": "inset",
+    "line": "font",
+    "row": "gap",
+    "column": "gap",
+    "columns": "gap",
+    "align": "place",
+    "justify": "place",
+    "width": "size",
+    "height": "size",
+    "min": "size",
+    "max": "size",
+    "inline": "size",
+    "block": "size",
+    "aspect": "size",
+}
+PSEUDO_ELEMENTS_LEGACY = ("before", "after", "first-line", "first-letter")
+
+
+def _matching(text: str, i: int, open_ch: str, close_ch: str) -> int:
+    """Index of the bracket closing the one at ``text[i]`` (strings skipped), or len."""
+    depth, quote, n = 0, "", len(text)
+    while i < n:
+        ch = text[i]
+        if quote:
+            if ch == "\\":
+                i += 1
+            elif ch == quote:
+                quote = ""
+        elif ch in "\"'":
+            quote = ch
+        elif ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return n
+
+
+def selector_specificity(selector: str) -> tuple[int, int, int]:
+    """(ids, classes/attributes/pseudo-classes, types/pseudo-elements) of one selector."""
+    a = b = c = 0
+    s, i, n = selector, 0, len(selector)
+    while i < n:
+        ch = s[i]
+        if ch == "\\":
+            i += 2
+        elif ch == "#":
+            a += 1
+            i += 1
+            while i < n and (s[i].isalnum() or s[i] in "-_\\" or ord(s[i]) > 127):
+                i += 1
+        elif ch == ".":
+            b += 1
+            i += 1
+            while i < n and (s[i].isalnum() or s[i] in "-_\\" or ord(s[i]) > 127):
+                i += 1
+        elif ch == "[":
+            b += 1
+            i = _matching(s, i, "[", "]") + 1
+        elif ch == ":":
+            element = s.startswith("::", i)
+            i += 2 if element else 1
+            m = re.match(r"[A-Za-z-]+", s[i:])
+            name = (m.group(0) if m else "").lower()
+            i += len(name)
+            args = ""
+            if i < n and s[i] == "(":
+                close = _matching(s, i, "(", ")")
+                args = s[i + 1 : close]
+                i = close + 1
+            if element or name in PSEUDO_ELEMENTS_LEGACY:
+                c += 1
+            elif name == "where":
+                pass
+            elif name in ("is", "not", "has", "matches", "-webkit-any", "any"):
+                inner = [selector_specificity(x) for x in split_selector_list(args)]
+                if inner:
+                    ia, ib, ic = max(inner)
+                    a, b, c = a + ia, b + ib, c + ic
+            elif name in ("nth-child", "nth-last-child") and " of " in f" {args} ":
+                inner = [
+                    selector_specificity(x) for x in split_selector_list(args.split(" of ", 1)[1])
+                ]
+                ia, ib, ic = max(inner) if inner else (0, 0, 0)
+                a, b, c = a + ia, b + ib + 1, c + ic
+            else:
+                b += 1
+        elif ch.isalpha() or ch == "_" or ord(ch) > 127:
+            m = re.match(r"[A-Za-z0-9_-]+(\|[A-Za-z0-9_-]+)?", s[i:])
+            c += 1
+            i += len(m.group(0)) if m else 1
+        else:
+            i += 1
+    return a, b, c
+
+
+def property_root(name: str) -> str:
+    """A coarse family for a property: longhands share their shorthand's root."""
+    name = name.strip().lower()
+    if name.startswith("--"):
+        return name
+    name = re.sub(r"^-(webkit|moz|ms|o)-", "", name)
+    root = name.split("-", 1)[0]
+    return PROPERTY_ROOT_ALIASES.get(root, root)
+
+
+def css_rules(css: str) -> list[tuple[list[str], set[tuple[str, bool]]]]:
+    """Flatten a stylesheet into (selectors, {(property root, important)}) rules.
+
+    Grouping at-rules (@media, @supports, …) are entered; @keyframes and @font-face
+    become pseudo-rules keyed by name, since a later one of the same name replaces an
+    earlier one. A style rule with nested rules (CSS nesting) is kept whole with the
+    pseudo-property "*", which conflicts with everything.
+    """
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.S)
+    rules: list[tuple[list[str], set[tuple[str, bool]]]] = []
+    i, n = 0, len(css)
+    while i < n:
+        brace, semi = css.find("{", i), css.find(";", i)
+        if brace < 0:
+            break
+        prelude = css[i:brace].strip()
+        if 0 <= semi < brace and prelude.startswith("@"):
+            i = semi + 1  # @import / @charset / @layer a, b;
+            continue
+        close = _matching(css, brace, "{", "}")
+        body = css[brace + 1 : close]
+        i = close + 1
+        if prelude.startswith("@"):
+            m = re.match(r"@(-[a-z]+-)?([A-Za-z-]+)\s*(.*)$", prelude, re.S)
+            name = (m.group(2) if m else "").lower()
+            arg = (m.group(3) if m else "").strip()
+            if name in CSS_GROUP_AT_RULES:
+                rules.extend(css_rules(body))
+            elif name == "keyframes":
+                rules.append(([""], {(f"@keyframes {arg}", False)}))
+            elif name == "font-face":
+                fam = re.search(r"font-family\s*:\s*([^;]+)", body, re.I)
+                key = fam.group(1).strip().strip("\"'").lower() if fam else ""
+                rules.append(([""], {(f"@font-face {key}", False)}))
+            continue
+        if "{" in body:
+            props = {("*", False), ("*", True)}
+        else:
+            props = set()
+            for decl in body.split(";"):
+                if ":" not in decl:
+                    continue
+                prop, value = decl.split(":", 1)
+                if not prop.strip():
+                    continue
+                props.add((property_root(prop), bool(re.search(r"!\s*important\s*$", value, re.I))))
+        selectors = split_selector_list(prelude)
+        if selectors and props:
+            rules.append((selectors, props))
+    return rules
+
+
+def selector_subject(selector: str) -> tuple[str, frozenset]:
+    """(type, classes) required of the element a selector matches: its last compound."""
+    depth, cut, i = 0, 0, 0
+    while i < len(selector):
+        ch = selector[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch in "([":
+            depth += 1
+        elif ch in ")]" and depth:
+            depth -= 1
+        elif depth == 0 and ch in " >+~\t\n":
+            cut = i + 1
+        i += 1
+    compound, previous = selector[cut:], None
+    while compound != previous:  # drop (...) and [...] contents, innermost first
+        previous, compound = compound, re.sub(r"\([^()]*\)|\[[^\]]*\]", "", compound)
+    compound = re.sub(r"::?[A-Za-z-]+", "", compound)
+    tag = re.match(r"[A-Za-z][A-Za-z0-9-]*", compound)
+    return (tag.group(0).lower() if tag else ""), frozenset(
+        re.findall(r"\.([A-Za-z0-9_-]+)", compound)
+    )
+
+
+class MarkupClasses:
+    """Which elements can exist: class combinations in the source markup, plus classes a
+    script may add (named in script text, or built from a quoted prefix like 'x-' + k)."""
+
+    def __init__(self, source: str):
+        self.sets: set[frozenset] = set()
+        scripts: list[str] = []
+        for tag in iter_tags(source):
+            if tag.closing:
+                continue
+            if tag.name == "script" and tag.inner:
+                scripts.append(source[tag.inner[0] : tag.inner[1]])
+            elif "class" in tag.attrs_text.lower():
+                classes = (tag.attrs().get("class") or "").split()
+                if classes:
+                    self.sets.add(frozenset(classes))
+        self.all = frozenset().union(*self.sets) if self.sets else frozenset()
+        self.script_text = "\n".join(scripts)
+        self._cache: dict[frozenset, bool] = {}
+        self._dead: dict[str, bool] = {}
+
+    def dead(self, cls: str) -> bool:
+        """A class no element has and no script can add: its rules match nothing."""
+        if cls in self.all:
+            return False
+        if cls not in self._dead:
+            text = self.script_text
+            alive = cls in text
+            for m in re.finditer(r"[-_]+", cls):
+                prefix = cls[: m.end()]
+                if (
+                    not alive
+                    and len(prefix) >= 3
+                    and re.search(re.escape(prefix) + r"[\"'`$]", text)
+                ):
+                    alive = True
+            self._dead[cls] = not alive
+        return self._dead[cls]
+
+    def can_share(self, a: tuple[str, frozenset], b: tuple[str, frozenset]) -> bool:
+        """Could one element match both subjects? Script-added classes never rule it out."""
+        if a[0] and b[0] and a[0] != b[0]:
+            return False
+        classes = a[1] | b[1]
+        if any(self.dead(c) for c in classes):
+            return False
+        need = classes & self.all
+        if not need:
+            return True
+        if need not in self._cache:
+            self._cache[need] = any(need <= s for s in self.sets)
+        return self._cache[need]
+
+
+class CascadeIndex:
+    """Rules of blocks that come later in the source than the one being checked."""
+
+    def __init__(self, markup: MarkupClasses | None = None):
+        self.markup = markup
+        # (property root, important, specificity) -> [(slide refs, subject)]
+        self.entries: dict[tuple, list[tuple[frozenset, tuple]]] = {}
+        self.wild: dict[tuple, list[tuple[frozenset, tuple]]] = {}  # "*" props: (important, spec)
+
+    @staticmethod
+    def _items(rules):
+        for selectors, props in rules:
+            for selector in selectors:
+                if selector == "":
+                    spec, refs, subject = (-1, -1, -1), frozenset(), ("", frozenset())
+                else:
+                    spec = selector_specificity(selector)
+                    # every data-slide value named, known or not: [data-slide="x"] only
+                    # ever matches inside slide x (an empty set: any slide)
+                    refs = frozenset(m.group(1) for m in SLIDE_REF_RE.finditer(selector))
+                    subject = selector_subject(selector)
+                for root, important in props:
+                    yield root, important, spec, refs, subject
+
+    def add(self, rules) -> None:
+        for root, important, spec, refs, subject in self._items(rules):
+            if root == "*":
+                self.wild.setdefault((important, spec), []).append((refs, subject))
+            else:
+                self.entries.setdefault((root, important, spec), []).append((refs, subject))
+
+    def _overlap(self, refs: frozenset, subject: tuple, others) -> bool:
+        for other_refs, other_subject in others:
+            if refs and other_refs and not refs & other_refs:
+                continue
+            if self.markup is None or self.markup.can_share(subject, other_subject):
+                return True
+        return False
+
+    def conflicts(self, rules) -> bool:
+        for root, important, spec, refs, subject in self._items(rules):
+            if root == "*":
+                hits = [
+                    x
+                    for (imp, sp), lst in self.wild.items()
+                    if (imp, sp) == (important, spec)
+                    for x in lst
+                ]
+                hits += [
+                    x
+                    for (_, imp, sp), lst in self.entries.items()
+                    if (imp, sp) == (important, spec)
+                    for x in lst
+                ]
+            else:
+                hits = self.entries.get((root, important, spec), []) + self.wild.get(
+                    (important, spec), []
+                )
+            if hits and self._overlap(refs, subject, hits):
+                return True
+        return False
+
+
+def sanitize_slide_id(value: str | None, fallback: str) -> str:
+    raw = (value or "").strip().lower()
+    cleaned = re.sub(r"[^a-z0-9-]+", "-", raw).strip("-")[:64].strip("-")
+    if not cleaned or not SLIDE_ID_RE.match(cleaned):
+        cleaned = fallback
+    return cleaned
+
+
+def retarget_slide_refs(text: str, old: str, new: str) -> str:
+    """Point every data-slide reference to ``old`` at ``new`` (markup, CSS and JS)."""
+    pattern = re.compile(r"(data-slide\s*=\s*\\?[\"']?)" + re.escape(old) + r"(?![A-Za-z0-9_-])")
+    return pattern.sub(lambda m: m.group(1) + new, text)
+
+
+def widen_slide_selectors(text: str, renames: dict[str, list[str]]) -> str:
+    """``[data-slide="x"]`` -> ``:is([data-slide="x"],[data-slide="x-2"])`` for renamed ids.
+
+    ``renames`` maps an original data-slide value to every slide id it became.
+    ``:is()`` keeps the selector's specificity, so the cascade is unchanged.
+    """
+    for old, new_ids in renames.items():
+        if new_ids == [old]:
+            continue
+        pattern = re.compile(r"\[\s*data-slide\s*=\s*([\"']?)" + re.escape(old) + r"\1\s*\]")
+        if len(new_ids) == 1:
+            replacement = f'[data-slide="{new_ids[0]}"]'
+        else:
+            replacement = ":is(" + ",".join(f'[data-slide="{i}"]' for i in new_ids) + ")"
+        text = pattern.sub(lambda _m, r=replacement: r, text)
+    return text
+
+
+def fetch_source(src: str) -> tuple[str, str]:
+    """Read a legacy deck from a path or an http(s) URL. Returns (text, label)."""
+    if re.match(r"^https?://", src, re.I):
+        request = urllib.request.Request(src, headers={"User-Agent": USER_AGENT})
+        try:
+            with urllib.request.urlopen(request, timeout=300) as response:
+                data = response.read(512 * 1024 * 1024 + 1)
+        except (urllib.error.URLError, OSError) as exc:
+            raise CliError(f"could not download {src}: {exc}") from exc
+        if len(data) > 512 * 1024 * 1024:
+            raise CliError(f"{src} is larger than 512 MB")
+        label = src
+    else:
+        path = Path(src)
+        if not path.is_file():
+            raise CliError(f"{src} is not a file")
+        data = path.read_bytes()
+        label = str(path)
+    try:
+        return data.decode("utf-8-sig"), label
+    except UnicodeDecodeError as exc:
+        raise CliError(f"{label} is not UTF-8 HTML") from exc
+
+
+class Block:
+    """A top-level <style>/<script>/<link> outside any slide section."""
+
+    def __init__(self, tag: Tag, text: str, after: int, in_head: bool):
+        self.tag = tag
+        self.kind = tag.name
+        self.attrs = tag.attrs()
+        self.outer = text[tag.start : tag.end]
+        self.inner = text[tag.inner[0] : tag.inner[1]] if tag.inner else ""
+        self.after = after  # index of the slide section this follows (-1: before the first)
+        self.in_head = in_head
+        self.position = tag.start
+        self.section: int | None = None  # set for a <style> inside a slide section
+
+
+def style_css(block: Block) -> str:
+    """A <style> block's CSS as deck-level text (its media attribute kept as @media)."""
+    media = (block.attrs.get("media") or "").strip()
+    css = block.inner.strip("\n")
+    if media and media.lower() != "all":
+        css = f"@media {media} {{\n{css}\n}}"
+    return css
+
+
+def plan_style_placement(
+    styles: list[Block], known: set[str], markup: MarkupClasses | None = None
+) -> dict[int, str]:
+    """Where each <style> block goes so the source's cascade order survives.
+
+    Returns {position: "deck" | "slide" | "section"}. The default is: head and multi-slide
+    blocks -> deck.css; a top-level block whose rules all target one slide -> that slide
+    file; a block inside a slide section -> stays there. Bundle order is deck < slide <
+    section, so a block is pulled back into deck.css (at its source position) when a
+    block that followed it in the source now lands earlier and has a rule of equal
+    specificity, for the same property family, that can reach the same slide.
+    """
+    rank_of = {"deck": 0, "slide": 1, "section": 2}
+    later = [CascadeIndex(markup), CascadeIndex(markup)]  # later blocks placed in deck / slide
+    placement: dict[int, str] = {}
+    for block in sorted(styles, key=lambda b: b.position, reverse=True):
+        if block.section is not None:
+            place = "section"
+        elif block.in_head or css_single_owner(block.inner, known) is None:
+            place = "deck"
+        else:
+            place = "slide"
+        rules = css_rules(style_css(block))
+        rank = rank_of[place]
+        if rank and any(later[r].conflicts(rules) for r in range(rank)):
+            place, rank = "deck", 0
+        if rank < 2:
+            later[rank].add(rules)
+        placement[block.position] = place
+    return placement
+
+
+def import_legacy(source: str, label: str = "legacy deck") -> dict:
+    """Convert a stage.js single-file deck into bundle files.
+
+    Returns {"deck": dict, "texts": {path: str}, "assets": {path: bytes}, "summary": dict}.
+    Nothing is written; see write_bundle().
+    """
+    head_end = 0
+    body_start = 0
+    title = ""
+    body_attrs: dict[str, str] = {}
+    for tag in iter_tags(source):
+        if tag.name == "title" and not tag.closing and not title and tag.inner:
+            raw = source[tag.inner[0] : tag.inner[1]]
+            title = " ".join(html_lib.unescape(re.sub(r"<[^>]+>", "", raw)).split())
+        elif tag.name == "head" and tag.closing:
+            head_end = tag.start
+        elif tag.name == "body" and not tag.closing:
+            body_start = tag.end
+            body_attrs = tag.attrs()
+            if not head_end:
+                head_end = tag.start
+            break
+    sections = [s for s in find_slide_sections(source) if s[0] >= body_start]
+    if not sections:
+        raise CliError(f'{label}: no top-level <section class="slide …"> elements found')
+
+    notes: list[str] = []
+    if body_attrs.get("class") or body_attrs.get("style"):
+        notes.append("<body> class/style attributes were dropped (the runtime owns <body>)")
+
+    # ---- top-level blocks: head, then the gaps between slide sections
+    blocks: list[Block] = []
+    dropped_tags: dict[str, int] = {}
+    ignore_tags = {"html", "head", "body", "meta", "title", "br", "base"}
+
+    def collect(start: int, end: int, after: int, in_head: bool) -> None:
+        for tag in iter_tags(source, start, end):
+            if tag.closing:
+                continue
+            if tag.name in ("style", "script"):
+                blocks.append(Block(tag, source, after, in_head))
+            elif tag.name == "link":
+                attrs = tag.attrs()
+                rel = (attrs.get("rel") or "").lower().split()
+                if "stylesheet" in rel:
+                    blocks.append(Block(tag, source, after, in_head))
+                elif "icon" in rel:
+                    dropped_tags["link rel=icon"] = dropped_tags.get("link rel=icon", 0) + 1
+            elif tag.name not in ignore_tags:
+                key = f"<{tag.name}>"
+                dropped_tags[key] = dropped_tags.get(key, 0) + 1
+
+    collect(0, head_end or body_start, -1, True)
+    gaps = [(body_start, sections[0][0], -1)]
+    for i, (_, end, _) in enumerate(sections):
+        nxt = sections[i + 1][0] if i + 1 < len(sections) else len(source)
+        gaps.append((end, nxt, i))
+    for start, end, after in gaps:
+        collect(start, end, after, False)
+    # <style> inside slide sections (also inside inline <svg>): global in the source too
+    for index, (start, end, opener) in enumerate(sections):
+        for tag in iter_tags(source, opener.end, end):
+            if tag.name == "style" and not tag.closing and tag.inner is not None:
+                inner_block = Block(tag, source, index, False)
+                inner_block.section = index
+                blocks.append(inner_block)
+    blocks.sort(key=lambda b: b.position)
+
+    # ---- slide ids (dedupe repeats with -2, -3 …)
+    originals = [s[2].attrs().get("data-slide") for s in sections]
+    used: set[str] = set()
+    reserved = {sanitize_slide_id(o, "") for o in originals if o}
+    ids: list[str] = []
+    renames: dict[str, list[str]] = {}
+    for index, original in enumerate(originals):
+        base = sanitize_slide_id(original, f"slide-{index + 1}")
+        candidate = base
+        n = 1
+        # skip ids already taken and ids another slide carries in the source
+        while candidate in used or (n > 1 and candidate in reserved):
+            n += 1
+            candidate = f"{base[:60]}-{n}"
+        used.add(candidate)
+        ids.append(candidate)
+        if original:
+            renames.setdefault(original, []).append(candidate)
+    known_values = set(renames)
+
+    # ---- assign blocks to slides or to the deck
+    css_parts: list[str] = []
+    imports: list[str] = []
+    global_scripts: list[str] = []
+    external_seen: set[str] = set()
+    owned: dict[int, list[Block]] = {i: [] for i in range(len(sections))}
+    occurrences: dict[str, list[int]] = {}
+    for index, original in enumerate(originals):
+        if original:
+            occurrences.setdefault(original, []).append(index)
+    stage_dropped = 0
+    placement = plan_style_placement(
+        [b for b in blocks if b.kind == "style"], known_values, MarkupClasses(source)
+    )
+    hoisted: dict[int, list[Block]] = {}
+    cascade_kept = 0
+    for block in blocks:
+        refs = {m.group(1) for m in SLIDE_REF_RE.finditer(block.inner)} & known_values
+        between = 0 <= block.after < len(sections) - 1 and not block.in_head
+        if block.kind == "link":
+            href = block.attrs.get("href") or ""
+            if re.match(r"^(https?:)?//", href):
+                imports.append(f'@import url("{href}");')
+            elif href.startswith("data:"):
+                css_parts.append(f'@import url("{href}");')
+            else:
+                notes.append(f"stylesheet link {href!r} dropped (not self-contained)")
+            continue
+        if block.kind == "script":
+            src = block.attrs.get("src")
+            script_type = (block.attrs.get("type") or "").strip().lower()
+            if src and ("stage.js" in src.lower()):
+                stage_dropped += 1
+                continue
+            if not src and is_stage_js(block.inner):
+                stage_dropped += 1
+                continue
+            if src:
+                if src in external_seen:
+                    continue
+                external_seen.add(src)
+                loader = (
+                    "(function () {\n  var s = document.createElement('script');\n"
+                    f"  s.src = {json.dumps(src)};\n"
+                    + ("  s.defer = true;\n" if "defer" in block.attrs else "")
+                    + ("  s.async = true;\n" if "async" in block.attrs else "")
+                    + ("  s.type = 'module';\n" if script_type == "module" else "")
+                    + "  document.head.appendChild(s);\n})();\n"
+                )
+                global_scripts.append(f"/* external script {src} (imported loader) */\n{loader}")
+                continue
+            if len(refs) == 1:
+                for idx in occurrences[next(iter(refs))]:
+                    owned[idx].append(block)
+            elif not refs and between:
+                owned[block.after].append(block)
+            elif script_type not in JS_TYPES:
+                notes.append(f"<script type={script_type!r}> outside the slides was dropped")
+            else:
+                if len(refs) > 1:
+                    notes.append(
+                        "a deck-level script touches several slides ("
+                        + ", ".join(sorted(refs))
+                        + "); deck scripts run after the first slide mounts, when far slides "
+                        "are still empty shells"
+                    )
+                elif re.search(
+                    r"document\.(querySelector(All)?|getElementsBy\w+)\s*\(", block.inner
+                ):
+                    notes.append(
+                        f"deck script theme/global-{len(global_scripts) + 1}.js queries the whole "
+                        "document; it runs once, after the first slide mounts, so it does not see "
+                        "slides mounted later"
+                    )
+                global_scripts.append(block.inner.strip("\n") + "\n")
+            continue
+        # <style>
+        place = placement[block.position]
+        if place == "section":
+            continue
+        if place == "slide":
+            style_owner = css_single_owner(block.inner, known_values)
+            for idx in occurrences[style_owner]:
+                owned[idx].append(block)
+            continue
+        if block.section is not None:
+            where = f"slide {ids[block.section]}"
+            hoisted.setdefault(block.section, []).append(block)
+            cascade_kept += 1
+        elif not block.in_head and css_single_owner(block.inner, known_values) is not None:
+            where = "body"
+            cascade_kept += 1
+        else:
+            where = "head" if block.in_head else "body"
+        label_id = f"#{block.attrs['id']}" if block.attrs.get("id") else ""
+        css_parts.append(f"/* ---- style{label_id} from {where} ---- */\n{style_css(block)}\n")
+
+    # ---- slide files
+    texts: dict[str, str] = {}
+    width = max(2, len(str(len(sections))))
+    deck_slides = []
+    backups = 0
+    for index, (start, end, opener) in enumerate(sections):
+        slide_id = ids[index]
+        original = originals[index]
+        section_html = source[start:end]
+        # styles kept in deck.css leave an empty <style> behind: same DOM, no rules
+        for block in sorted(hoisted.get(index, []), key=lambda b: b.position, reverse=True):
+            a, b = block.tag.start - start, block.tag.end - start
+            open_tag = section_html[a : block.tag.inner[0] - start]
+            section_html = section_html[:a] + open_tag + "</style>" + section_html[b:]
+        open_text = source[opener.start : opener.end]
+        if original != slide_id:
+            open_text = set_open_tag_attr(open_text, "data-slide", slide_id)
+            section_html = open_text + section_html[opener.end - start :]
+        parts = [section_html]
+        for block in sorted(owned[index], key=lambda b: b.position):
+            parts.append(block.outer)
+        text = "\n".join(parts) + "\n"
+        if original and original != slide_id:
+            text = retarget_slide_refs(text, original, slide_id)
+        text = widen_slide_selectors(text, renames)
+        path = f"slides/{index + 1:0{width}d}-{slide_id}.html"
+        texts[path] = text
+        entry = {"id": slide_id, "layout": "html", "html": path}
+        if "data-backup" in opener.attrs():
+            entry["backup"] = True
+            backups += 1
+        deck_slides.append(entry)
+
+    css_text = "\n".join(imports + ([""] if imports else []) + css_parts)
+    css_text = widen_slide_selectors(css_text, renames)
+    deck: dict = {"schema": 1, "title": (title or "Imported deck")[:MAX_TITLE], "theme": "none"}
+    if css_text.strip():
+        texts["theme/deck.css"] = css_text
+        deck["css"] = ["theme/deck.css"]
+    script_paths = []
+    for i, js in enumerate(global_scripts, start=1):
+        path = f"theme/global-{i}.js"
+        texts[path] = widen_slide_selectors(js, renames)
+        script_paths.append(path)
+    if script_paths:
+        deck["scripts"] = script_paths
+    deck["slides"] = deck_slides
+
+    # ---- data: URIs -> assets/
+    store = AssetStore()
+    for path in list(texts):
+        texts[path] = extract_data_uris(texts[path], store, path)
+
+    renamed = {o: v for o, v in renames.items() if v != [o]}
+    if cascade_kept:
+        notes.append(
+            f"{cascade_kept} slide <style> block(s) kept in theme/deck.css at their source "
+            "position: a later style has equally specific rules for the same properties, "
+            "and moving them into the slide file could change which rule wins"
+        )
+    if dropped_tags:
+        notes.append(
+            "dropped outside the slides: "
+            + ", ".join(f"{k}×{v}" if v > 1 else k for k, v in sorted(dropped_tags.items()))
+        )
+    largest = sorted(store.by_sha.values(), key=lambda pd: len(pd[1]), reverse=True)[:5]
+    summary = {
+        "source": label,
+        "title": deck["title"],
+        "slides": len(deck_slides),
+        "backups": backups,
+        "renamed_ids": renamed,
+        "unique_assets": len(store.by_sha),
+        "asset_references": store.occurrences,
+        "duplicates_removed": store.occurrences - len(store.by_sha),
+        "duplicate_bytes": store.duplicate_bytes,
+        "asset_bytes": store.total_bytes,
+        "text_bytes": sum(len(t.encode("utf-8")) for t in texts.values()),
+        "source_bytes": len(source.encode("utf-8")),
+        "stage_js_dropped": stage_dropped,
+        "global_scripts": len(script_paths),
+        "largest": [(p, len(d)) for p, d in largest],
+        "notes": notes + store.notes + store.left_inline,
+    }
+    return {"deck": deck, "texts": texts, "assets": store.files(), "summary": summary}
+
+
+def write_bundle(result: dict, out_dir: Path, force: bool = False) -> None:
+    if out_dir.exists() and any(out_dir.iterdir()):
+        if not force:
+            raise CliError(f"{out_dir} is not empty (use --force to replace its bundle files)")
+        for name in ("deck.json", "assets", "slides", "theme"):
+            target = out_dir / name
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            elif target.exists() or target.is_symlink():
+                target.unlink()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for path, text in result["texts"].items():
+        dest = out_dir / path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text, encoding="utf-8")
+    for path, data in result["assets"].items():
+        dest = out_dir / path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(data)
+    deck_text = json.dumps(result["deck"], indent=2, ensure_ascii=False) + "\n"
+    (out_dir / "deck.json").write_text(deck_text, encoding="utf-8")
+
+
+def print_import_summary(summary: dict, out_dir: Path) -> None:
+    s = summary
+    say(f"Imported {s['source']}")
+    say(f"  title            {s['title']}")
+    say(f"  slides           {s['slides']} ({s['backups']} backup)")
+    for old, new in s["renamed_ids"].items():
+        say(f'  repeated id      data-slide="{old}" -> {", ".join(new)}')
+    say(
+        f"  assets           {s['unique_assets']} unique from {s['asset_references']} data: URIs "
+        f"({s['duplicates_removed']} duplicates removed, {human_mb(s['duplicate_bytes'])} saved)"
+    )
+    say(f"  asset bytes      {human_mb(s['asset_bytes'])} raw")
+    text_mb, source_mb = human_mb(s["text_bytes"]), human_mb(s["source_bytes"])
+    say(f"  text files       {text_mb} (source was {source_mb})")
+    say(f"  stage.js         {'dropped' if s['stage_js_dropped'] else 'not found'}")
+    say(f"  deck scripts     {s['global_scripts']}")
+    if s["largest"]:
+        say("  largest assets")
+        for path, size in s["largest"]:
+            say(f"    {human_mb(size):>10}  {path}")
+    for note in s["notes"]:
+        say(f"  note: {note}")
+    say(f"Wrote {out_dir}. Next: showcase-deck validate {out_dir}")
+
+
+# --------------------------------------------------------------------------- preview
+
+# Values of these keys are never asset references (mirrors the server's Rewriter).
+SKIP_REWRITE_KEYS = frozenset({"id", "layout", "when", "tone", "side", "fit"})
+STYLE_CLOSE_RE = re.compile(r"</(style)", re.IGNORECASE)
+
+
+def rewrite_deck_value(value, mapping: dict[str, str], key: str | None = None):
+    if isinstance(value, str):
+        return value if key in SKIP_REWRITE_KEYS else rewrite_refs(value, mapping)
+    if isinstance(value, list):
+        return [rewrite_deck_value(item, mapping) for item in value]
+    if isinstance(value, dict):
+        return {k: rewrite_deck_value(v, mapping, k) for k, v in value.items()}
+    return value
+
+
+def json_for_script(data) -> str:
+    return json.dumps(data, ensure_ascii=False, separators=(",", ":")).replace("<", "\\u003c")
+
+
+def build_deck_data(
+    deck: dict, texts: dict[str, str], mapping: dict[str, str], slug: str, version: int
+) -> dict:
+    """The ``deck-data`` JSON the server embeds in its viewer page."""
+
+    def file_text(path: str) -> str:
+        return rewrite_refs(texts.get(path, ""), mapping)
+
+    slides = []
+    for slide in deck["slides"]:
+        resolved = rewrite_deck_value(slide, mapping)
+        if slide.get("layout") == "html":
+            resolved["source"] = file_text(slide["html"])
+        slides.append(resolved)
+    return {
+        "slug": slug,
+        "version": version,
+        "title": deck["title"],
+        "theme": deck.get("theme") or "neutral",
+        "flags": deck.get("flags") or {},
+        "fine": deck.get("fine") or "",
+        "slides": slides,
+        "scriptSources": [file_text(path) for path in deck.get("scripts") or []],
+    }
+
+
+def render_wrapper(
+    deck: dict,
+    texts: dict[str, str],
+    mapping: dict[str, str],
+    *,
+    slug: str,
+    version: int,
+    runtime_base: str,
+) -> str:
+    """Same page shape as the server's render_wrapper, with a configurable runtime base."""
+    data = build_deck_data(deck, texts, mapping, slug, version)
+    css = "\n".join(rewrite_refs(texts.get(p, ""), mapping) for p in deck.get("css") or [])
+    css = STYLE_CLOSE_RE.sub(r"<\\/\1", css)
+    theme = data["theme"]
+    theme_link = (
+        f'<link rel="stylesheet" href="{runtime_base}/theme-neutral.css">\n'
+        if theme == "neutral"
+        else ""
+    )
+    return (
+        "<!doctype html>\n"
+        '<html lang="en">\n'
+        "<head>\n"
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f"<title>{html_lib.escape(deck['title'])}</title>\n"
+        f'<link rel="stylesheet" href="{runtime_base}/stage.css">\n'
+        f"{theme_link}"
+        f'<style id="deck-css">{css}</style>\n'
+        "</head>\n"
+        "<body>\n"
+        '<div id="deck-root"></div>\n'
+        f'<script type="application/json" id="deck-data">{json_for_script(data)}</script>\n'
+        f'<script src="{runtime_base}/runtime.js" defer></script>\n'
+        "</body>\n"
+        "</html>\n"
+    )
+
+
+def default_runtime_dir() -> Path:
+    return Path(__file__).resolve().parent.parent / "src" / "app" / "static" / "runtime"
+
+
+def bundle_texts(files: dict[str, Path], deck: dict) -> dict[str, str]:
+    """Texts of the files the wrapper inlines (css, scripts, html slides)."""
+    wanted = set(deck.get("css") or []) | set(deck.get("scripts") or [])
+    wanted |= {s["html"] for s in deck["slides"] if s.get("layout") == "html" and "html" in s}
+    return {p: read_text(files[p]) for p in wanted if p in files}
+
+
+def write_preview(root: Path, deck: dict, files: dict[str, Path], runtime_dir: Path) -> Path:
+    out = root / ".preview"
+    if out.exists():
+        shutil.rmtree(out)
+    out.mkdir(parents=True)
+    rt_out = out / "_rt"
+    missing = []
+    if runtime_dir.is_dir():
+        shutil.copytree(runtime_dir, rt_out, ignore=shutil.ignore_patterns(".*"))
+    else:
+        rt_out.mkdir()
+    needed = ["runtime.js", "stage.css"]
+    if (deck.get("theme") or "neutral") == "neutral":
+        needed.append("theme-neutral.css")
+    missing = [name for name in needed if not (rt_out / name).is_file()]
+    if missing:
+        warn(
+            f"viewer runtime file(s) missing in {runtime_dir}: {', '.join(missing)}; "
+            "the preview page is written but will not render until the runtime is built"
+        )
+    mapping = {path: f"../{path}" for path in files}
+    page = render_wrapper(
+        deck,
+        bundle_texts(files, deck),
+        mapping,
+        slug=root.resolve().name,
+        version=0,
+        runtime_base="_rt",
+    )
+    index = out / "index.html"
+    index.write_text(page, encoding="utf-8")
+    return index
+
+
+# --------------------------------------------------------------------------- owner token
+
+
+def token_file_path() -> Path:
+    home = os.environ.get("HOME") or str(Path.home())
+    raw = os.environ.get("SHOWCASE_OWNER_TOKEN_FILE") or f"{home}/.config/showcase/owner-token"
+    if raw == "~":
+        raw = home
+    elif raw.startswith("~/"):
+        raw = f"{home}/{raw[2:]}"
+    if not raw:
+        raise CliError("SHOWCASE_OWNER_TOKEN_FILE must not be empty")
+    return Path(raw)
+
+
+def _validate_token(token: str) -> str:
+    if not token:
+        raise CliError("owner token is empty")
+    if len(token) > 512:
+        raise CliError("owner token is too long")
+    if "\n" in token or "\r" in token:
+        raise CliError("owner token contains a newline")
+    return token
+
+
+def _read_token_file(path: Path) -> str | None:
+    if path.is_symlink():
+        raise CliError(f"refusing to use symlinked token file: {path}")
+    if not path.exists():
+        return None
+    if not path.is_file():
+        raise CliError(f"token path is not a regular file: {path}")
+    try:
+        token = path.read_text(encoding="utf-8").rstrip("\n")
+    except OSError as exc:
+        raise CliError(f"could not read token file: {path}") from exc
+    _validate_token(token)
+    try:
+        os.chmod(path, 0o600)
+    except OSError as exc:
+        raise CliError(f"could not secure token file: {path}") from exc
+    return token
+
+
+def load_token(create: bool) -> str | None:
+    """The owner token: $SHOWCASE_OWNER_TOKEN, else the token file (created if asked)."""
+    env = os.environ.get("SHOWCASE_OWNER_TOKEN")
+    if env:
+        return _validate_token(env)
+    path = token_file_path()
+    token = _read_token_file(path)
+    if token is not None or not create:
+        return token
+    parent = path.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+        if str(parent) != ".":
+            os.chmod(parent, 0o700)
+    except OSError as exc:
+        raise CliError(f"could not create token directory: {parent}") from exc
+    generated = secrets.token_urlsafe(32)
+    fd, temp = tempfile.mkstemp(prefix=path.name + ".tmp.", dir=parent)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(generated + "\n")
+        try:
+            # A hard link installs the complete, mode-600 file without overwriting
+            # a token another process may have initialized concurrently.
+            os.link(temp, path)
+            return generated
+        except FileExistsError:
+            pass
+    finally:
+        try:
+            os.unlink(temp)
+        except OSError:
+            pass
+    token = _read_token_file(path)
+    if token is None:
+        raise CliError(f"could not install token file: {path}")
+    return token
+
+
+# --------------------------------------------------------------------------- HTTP
+
+
+def base_url() -> str:
+    url = os.environ.get("SHOWCASE_URL") or DEFAULT_SHOWCASE_URL
+    if not re.match(r"^https?://", url):
+        raise CliError("SHOWCASE_URL must start with http:// or https://")
+    if any(ch in url for ch in "\n\r?#"):
+        raise CliError("SHOWCASE_URL must not contain a query, fragment, or newline")
+    url = url.rstrip("/")
+    parsed = urllib.parse.urlsplit(url)
+    if url in ("http:", "https:") or not parsed.netloc or parsed.username or parsed.password:
+        raise CliError("SHOWCASE_URL must include a host and no embedded credentials")
+    if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+        raise CliError("SHOWCASE_URL requires HTTPS outside loopback")
+    return url
+
+
+class HttpError(CliError):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+
+
+RETRY_STATUSES = (429, 500, 502, 503, 504)
+
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Redirects must never forward owner or OIDC credentials to a new host."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+class Client:
+    """Tiny JSON/bytes HTTP client with retries. Never exposes owner or bearer tokens."""
+
+    def __init__(
+        self, base: str, token: str | None, retries: int = 4, sleep=time.sleep, opener=None
+    ):
+        parsed = urllib.parse.urlsplit(base)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise CliError("Showcase base URL must have an HTTP(S) host")
+        if parsed.scheme == "http" and parsed.hostname not in {"localhost", "127.0.0.1", "::1"}:
+            raise CliError("Showcase requires HTTPS outside loopback")
+        self.base = base
+        self._token = token
+        self.retries = retries
+        self.sleep = sleep
+        # Never send loopback demo credentials through an ambient HTTP proxy.
+        handlers = [_NoRedirect()]
+        if parsed.hostname in {"localhost", "127.0.0.1", "::1"}:
+            handlers.insert(0, urllib.request.ProxyHandler({}))
+        self.opener = opener or urllib.request.build_opener(*handlers).open
+
+    def _scrub(self, text: str) -> str:
+        if self._token and self._token in text:
+            return "(response withheld: it contained the owner token)"
+        auth_token = os.environ.get("SHOWCASE_AUTH_TOKEN", "").strip()
+        if auth_token and auth_token in text:
+            return "(response withheld: it contained the auth token)"
+        return text
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: bytes | None = None,
+        content_type: str | None = None,
+        headers: dict | None = None,
+        timeout: float = 120.0,
+    ) -> tuple[int, bytes]:
+        url = self.base + path
+        all_headers = {"User-Agent": USER_AGENT, "Accept": "application/json"}
+        if content_type:
+            all_headers["Content-Type"] = content_type
+        auth_token = os.environ.get("SHOWCASE_AUTH_TOKEN", "").strip()
+        all_headers.update(headers or {})
+        # The security headers are never part of a redirected request; this is
+        # defense in depth on top of the no-redirect opener.
+        all_headers.pop("Authorization", None)
+        all_headers.pop("X-Owner-Token", None)
+        attempt = 0
+        while True:
+            attempt += 1
+            req = urllib.request.Request(url, data=body, method=method, headers=all_headers)
+            if self._token:
+                req.add_unredirected_header("X-Owner-Token", self._token)
+            if auth_token:
+                req.add_unredirected_header("Authorization", "Bearer " + auth_token)
+            try:
+                with self.opener(req, timeout=timeout) as response:
+                    return response.status, response.read()
+            except urllib.error.HTTPError as exc:
+                payload = exc.read() if hasattr(exc, "read") else b""
+                if exc.code in RETRY_STATUSES and attempt <= self.retries:
+                    self._backoff(attempt, f"HTTP {exc.code}", method, path)
+                    continue
+                raise HttpError(exc.code, self._describe(exc.code, payload)) from None
+            except OSError as exc:  # URLError, timeouts, resets (HTTPError handled above)
+                if attempt <= self.retries:
+                    self._backoff(attempt, type(exc).__name__, method, path)
+                    continue
+                reason = getattr(exc, "reason", exc)
+                raise CliError(f"request failed: {method} {path}: {self._scrub(str(reason))}")
+
+    def _backoff(self, attempt: int, why: str, method: str, path: str) -> None:
+        delay = min(2 ** (attempt - 1), 15)
+        warn(f"{method} {path}: {why}; retrying in {delay}s ({attempt}/{self.retries})")
+        self.sleep(delay)
+
+    def _describe(self, status: int, payload: bytes) -> str:
+        detail = ""
+        try:
+            data = json.loads(payload.decode("utf-8"))
+            if isinstance(data, dict) and isinstance(data.get("detail"), str):
+                detail = " ".join(data["detail"].split())
+        except (ValueError, UnicodeDecodeError):
+            pass
+        detail = self._scrub(detail)
+        auth_token = os.environ.get("SHOWCASE_AUTH_TOKEN", "").strip()
+        if auth_token and auth_token in detail:
+            detail = "(response withheld: it contained the auth token)"
+        return f"HTTP {status}: {detail}" if detail else f"HTTP {status}"
+
+    def json(self, method: str, path: str, payload=None, headers: dict | None = None):
+        body = None if payload is None else json.dumps(payload).encode("utf-8")
+        _, data = self.request(
+            method,
+            path,
+            body=body,
+            content_type="application/json" if body is not None else None,
+            headers=headers,
+        )
+        try:
+            return json.loads(data.decode("utf-8")) if data else None
+        except (ValueError, UnicodeDecodeError):
+            raise CliError(f"{method} {path}: server returned invalid JSON") from None
+
+
+def check_slug(slug: str) -> str:
+    if not SLUG_RE.match(slug or ""):
+        raise CliError("SLUG must be 1-64 lowercase letters, digits, or hyphens")
+    return slug
+
+
+def quote_slug(slug: str) -> str:
+    return urllib.parse.quote(check_slug(slug), safe="")
+
+
+# --------------------------------------------------------------------------- init
+
+INIT_BACKDROP_SVG = """<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" \
+viewBox="0 0 1920 1080">
+  <defs>
+    <linearGradient id="g" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#1a0f0a"/>
+      <stop offset=".55" stop-color="#283f69"/>
+      <stop offset="1" stop-color="#4f70b8"/>
+    </linearGradient>
+  </defs>
+  <rect width="1920" height="1080" fill="url(#g)"/>
+</svg>
+"""
+
+INIT_CUSTOM_SLIDE = """<section class="slide" data-slide="custom">
+  <h2 class="cs-title">A custom slide</h2>
+  <p class="cs-body">Anything you can build in HTML, CSS and JS:
+    <b class="cs-count" data-count>42</b> counts up on entry.</p>
+  <img class="cs-img" src="assets/backdrop.svg" alt="">
+  <aside class="notes">Speaker notes for this slide.</aside>
+</section>
+<style>
+  .slide[data-slide="custom"] { background: #F4F1EB; color: #1a1a1a; padding: 120px 160px; }
+  .slide[data-slide="custom"] .cs-title { font-size: 88px; margin: 0 0 32px; }
+  .slide[data-slide="custom"] .cs-body { font-size: 36px; max-width: 1100px; }
+  .slide[data-slide="custom"] .cs-img { position: absolute; right: 160px; bottom: 120px;
+    width: 480px; border-radius: 24px; }
+</style>
+<script>
+  document.addEventListener("showcase:slide", function (e) {
+    var sec = document.querySelector('.slide[data-slide="custom"]');
+    if (sec && e.detail.slide === sec) console.log("custom slide is on stage");
+  });
+</script>
+"""
+
+
+def init_deck(title: str) -> dict:
+    return {
+        "schema": 1,
+        "title": title,
+        "theme": "neutral",
+        "fine": "A small synthetic example deck.",
+        "slides": [
+            {
+                "id": "opener",
+                "layout": "title",
+                "kicker": "Demo",
+                "title": title,
+                "subtitle": "One line on why this matters",
+                "media": "assets/backdrop.svg",
+            },
+            {
+                "id": "proof",
+                "layout": "stats",
+                "title": "The numbers",
+                "stats": [
+                    {"value": "100×", "label": "faster at sorting blocks"},
+                    {"value": "0.6 ms", "label": "per answer", "sub": "on one laptop"},
+                ],
+                "notes": "Speaker notes: never shown on stage.",
+            },
+            {"id": "custom", "layout": "html", "html": "slides/custom.html"},
+            {
+                "id": "close",
+                "layout": "close",
+                "title": "Thank you",
+                "points": ["First takeaway", "Second takeaway"],
+            },
+        ],
+    }
+
+
+def cmd_init(args) -> int:
+    root = Path(args.dir)
+    if (root / "deck.json").exists():
+        raise CliError(f"{root / 'deck.json'} already exists")
+    title = args.title or root.resolve().name.replace("-", " ").strip().title() or "My deck"
+    (root / "assets").mkdir(parents=True, exist_ok=True)
+    (root / "slides").mkdir(parents=True, exist_ok=True)
+    backdrop = root / "assets" / "backdrop.svg"
+    if not backdrop.exists():
+        backdrop.write_text(INIT_BACKDROP_SVG, encoding="utf-8")
+    custom = root / "slides" / "custom.html"
+    if not custom.exists():
+        custom.write_text(INIT_CUSTOM_SLIDE, encoding="utf-8")
+    deck_text = json.dumps(init_deck(title), indent=2, ensure_ascii=False) + "\n"
+    (root / "deck.json").write_text(deck_text, encoding="utf-8")
+    say(f"Created {root}/deck.json with 4 slides (title, stats, html, close).")
+    say(
+        f"Next: edit deck.json, then  showcase-deck preview {root}  and  "
+        f"showcase-deck push {root} --slug <slug>"
+    )
+    return 0
+
+
+# --------------------------------------------------------------------------- validate / preview
+
+
+def require_valid(root: Path) -> tuple[dict, dict[str, Path], Report]:
+    report, deck, files = validate_bundle(root)
+    print_report(report)
+    if not report.ok:
+        raise CliError(f"{root}: {len(report.errors)} error(s); fix them and try again")
+    return deck, files, report
+
+
+def cmd_validate(args) -> int:
+    root = Path(args.dir)
+    report, deck, files = validate_bundle(root)
+    print_report(report)
+    if not report.ok:
+        say(f"{root}: {len(report.errors)} error(s), {len(report.warnings)} warning(s)")
+        return 1
+    total = sum(p.stat().st_size for p in files.values())
+    say(
+        f"{root}: OK, {len(deck['slides'])} slides, {len(files)} files, {human_mb(total)}"
+        + (f", {len(report.warnings)} warning(s)" if report.warnings else "")
+    )
+    return 0
+
+
+def cmd_preview(args) -> int:
+    root = Path(args.dir)
+    deck, files, _ = require_valid(root)
+    runtime_dir = Path(args.runtime) if args.runtime else default_runtime_dir()
+    index = write_preview(root, deck, files, runtime_dir)
+    say(f"Wrote {index}")
+    say(
+        f"Serve it:  python3 -m http.server 8765 --directory {root}  "
+        "then open http://localhost:8765/.preview/"
+    )
+    return 0
+
+
+# --------------------------------------------------------------------------- push
+
+
+def cmd_push(args) -> int:
+    root = Path(args.dir)
+    slug = check_slug(args.slug)
+    deck, files, _ = require_valid(root)
+    hashes: dict[str, str] = {}
+    sizes: dict[str, int] = {}
+    for path, full in files.items():
+        hashes[path] = sha256_file(full)
+        sizes[hashes[path]] = full.stat().st_size
+    client = Client(base_url(), load_token(create=True))
+    unique = sorted(set(hashes.values()))
+    missing: set[str] = set()
+    for start in range(0, len(unique), 5000):
+        reply = client.json("POST", "/api/assets/missing", {"hashes": unique[start : start + 5000]})
+        if not isinstance(reply, dict) or not isinstance(reply.get("missing"), list):
+            raise CliError("server returned an invalid /api/assets/missing response")
+        missing.update(h.lower() for h in reply["missing"] if isinstance(h, str))
+    to_send = [(path, sha) for path, sha in sorted(hashes.items()) if sha in missing]
+    sent: set[str] = set()
+    uploaded = 0
+    for n, (path, sha) in enumerate(to_send, start=1):
+        if sha in sent:
+            continue
+        data = files[path].read_bytes()
+        if hashlib.sha256(data).hexdigest() != sha:
+            raise CliError(f"{path} changed while pushing; run push again")
+        say(f"  [{n}/{len(to_send)}] {path}  {human_mb(len(data))}")
+        client.request(
+            "PUT", f"/api/assets/{sha}", body=data, content_type=mime_for(path), timeout=600
+        )
+        sent.add(sha)
+        uploaded += len(data)
+    reused = sum(size for sha, size in sizes.items() if sha not in sent)
+    payload = {"deck": deck, "files": hashes, "message": args.message or ""}
+    reply = client.json(
+        "POST",
+        f"/api/decks/{quote_slug(slug)}/versions",
+        payload,
+        headers={"X-Idempotency-Key": "showcase-deck-" + secrets.token_hex(16)},
+    )
+    if not isinstance(reply, dict) or not isinstance(reply.get("version"), int):
+        raise CliError("server returned an invalid push response")
+    base = client.base
+    url = reply.get("url") or f"/{slug}"
+    pinned = reply.get("pinned_url") or f"/{slug}/v{reply['version']}"
+    say(f"Published {slug} v{reply['version']}")
+    say(f"  live    {base}{url}")
+    say(f"  pinned  {base}{pinned}")
+    say(f"  uploaded {human_mb(uploaded)}, reused {human_mb(reused)}")
+    return 0
+
+
+# --------------------------------------------------------------------------- versions / pull / diff
+
+
+def read_client() -> Client:
+    return Client(base_url(), load_token(create=False))
+
+
+def get_version(client: Client, slug: str, version: int | None) -> dict:
+    if version is None:
+        rows = client.json("GET", f"/api/decks/{quote_slug(slug)}/versions")
+        if not isinstance(rows, list) or not rows:
+            raise CliError(f"{slug} has no versions")
+        version = max(int(row["version"]) for row in rows)
+    data = client.json("GET", f"/api/decks/{quote_slug(slug)}/versions/{int(version)}")
+    if not isinstance(data, dict) or not isinstance(data.get("deck"), dict):
+        raise CliError("server returned an invalid version")
+    files = data.get("files") or {}
+    if not isinstance(files, dict):
+        raise CliError("server returned an invalid file map")
+    return data
+
+
+def cmd_versions(args) -> int:
+    client = read_client()
+    rows = client.json("GET", f"/api/decks/{quote_slug(args.slug)}/versions")
+    if not isinstance(rows, list):
+        raise CliError("server returned an invalid versions list")
+    if not rows:
+        say(f"{args.slug} has no versions")
+        return 0
+    for row in rows:
+        created = (row.get("created_at") or "")[:19].replace("T", " ")
+        size = human_mb(int(row.get("size_bytes") or 0))
+        message = " ".join(str(row.get("message") or "").split())
+        say(f"v{row.get('version')}\t{created}\t{size:>10}\t{message}")
+    say(f"pinned: {client.base}/{args.slug}/v<N>")
+    return 0
+
+
+def cmd_pull(args) -> int:
+    slug = check_slug(args.slug)
+    root = Path(args.dir)
+    if root.exists() and any(root.iterdir()) and not args.force:
+        raise CliError(f"{root} is not empty (use --force to write into it)")
+    client = read_client()
+    data = get_version(client, slug, args.version)
+    files: dict = data["files"]
+    for path, sha in files.items():
+        problem = path_problem(path) if isinstance(path, str) else "is not a string"
+        if problem or not isinstance(sha, str) or not SHA_RE.match(sha.lower()):
+            raise CliError(f"server listed an unsafe file {str(path)[:80]!r}; refusing to pull")
+    root.mkdir(parents=True, exist_ok=True)
+    total = 0
+    for n, (path, sha) in enumerate(sorted(files.items()), start=1):
+        sha = sha.lower()
+        _, body = client.request(
+            "GET",
+            f"/{quote_slug(slug)}/_a/{sha}.{ext_of(path)}",
+            timeout=600,
+            headers={"Accept": "*/*"},
+        )
+        if hashlib.sha256(body).hexdigest() != sha:
+            raise CliError(f"{path}: downloaded bytes do not match sha256 {sha}")
+        dest = root / path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(body)
+        total += len(body)
+        say(f"  [{n}/{len(files)}] {path}  {human_mb(len(body))}")
+    if "deck.json" not in files:
+        text = json.dumps(data["deck"], indent=2, ensure_ascii=False) + "\n"
+        (root / "deck.json").write_text(text, encoding="utf-8")
+    say(f"Pulled {slug} v{data.get('version')} into {root} ({human_mb(total)})")
+    return 0
+
+
+def diff_versions(a: dict, b: dict, label_a: str, label_b: str) -> list[str]:
+    lines = list(
+        difflib.unified_diff(
+            json.dumps(a["deck"], indent=2, ensure_ascii=False).splitlines(),
+            json.dumps(b["deck"], indent=2, ensure_ascii=False).splitlines(),
+            fromfile=f"{label_a}/deck.json",
+            tofile=f"{label_b}/deck.json",
+            lineterm="",
+        )
+    )
+    fa, fb = a.get("files") or {}, b.get("files") or {}
+    changes = []
+    for path in sorted(set(fa) | set(fb)):
+        if path == "deck.json":
+            continue
+        if path not in fa:
+            changes.append(f"  added    {path}")
+        elif path not in fb:
+            changes.append(f"  removed  {path}")
+        elif fa[path] != fb[path]:
+            changes.append(f"  changed  {path}")
+    if changes:
+        lines += ["", f"files {label_a} -> {label_b}:"] + changes
+    return lines
+
+
+def cmd_diff(args) -> int:
+    slug = check_slug(args.slug)
+    client = read_client()
+    va = get_version(client, slug, parse_version(args.a))
+    vb = get_version(client, slug, parse_version(args.b))
+    lines = diff_versions(va, vb, f"v{va['version']}", f"v{vb['version']}")
+    for line in lines:
+        say(line)
+    if not lines:
+        say(f"v{va['version']} and v{vb['version']} are identical")
+    return 0
+
+
+def parse_version(text: str) -> int:
+    match = re.match(r"^v?(\d+)$", str(text))
+    if not match:
+        raise CliError(f"{text!r} is not a version number (e.g. 3 or v3)")
+    return int(match.group(1))
+
+
+# --------------------------------------------------------------------------- import
+
+
+def cmd_import(args) -> int:
+    source, label = fetch_source(args.src)
+    result = import_legacy(source, label)
+    out_dir = Path(args.outdir)
+    write_bundle(result, out_dir, force=args.force)
+    print_import_summary(result["summary"], out_dir)
+    return 0
+
+
+# --------------------------------------------------------------------------- main
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="showcase-deck",
+        description="Make, check, publish and import Showcase deck bundles.",
+        epilog="See README.md and examples/synthetic-deck/ for the bundle format.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True, metavar="COMMAND")
+
+    p = sub.add_parser("init", help="scaffold a new deck bundle")
+    p.add_argument("dir")
+    p.add_argument("--title")
+    p.set_defaults(func=cmd_init)
+
+    p = sub.add_parser("validate", help="check a bundle the way the server does")
+    p.add_argument("dir")
+    p.set_defaults(func=cmd_validate)
+
+    p = sub.add_parser("preview", help="write DIR/.preview/index.html for a local look")
+    p.add_argument("dir")
+    p.add_argument("--runtime", help="viewer runtime folder (default: the repo's built runtime)")
+    p.set_defaults(func=cmd_preview)
+
+    p = sub.add_parser("push", help="upload changed files and publish a new version")
+    p.add_argument("dir")
+    p.add_argument("--slug", required=True)
+    p.add_argument("-m", "--message", default="")
+    p.set_defaults(func=cmd_push)
+
+    p = sub.add_parser("versions", help="list a deck's versions, newest first")
+    p.add_argument("slug")
+    p.set_defaults(func=cmd_versions)
+
+    p = sub.add_parser("pull", help="download a version into a folder")
+    p.add_argument("slug")
+    p.add_argument("dir")
+    p.add_argument("--version", type=parse_version, help="version number (default: latest)")
+    p.add_argument("--force", action="store_true", help="write into a non-empty folder")
+    p.set_defaults(func=cmd_pull)
+
+    p = sub.add_parser("diff", help="compare two versions (deck.json + file changes)")
+    p.add_argument("slug")
+    p.add_argument("a")
+    p.add_argument("b")
+    p.set_defaults(func=cmd_diff)
+
+    p = sub.add_parser("import", help="convert a legacy single-file HTML deck into a bundle")
+    p.add_argument("src", help="path or http(s) URL of the legacy .html deck")
+    p.add_argument("outdir")
+    p.add_argument("--force", action="store_true", help="replace the bundle files in OUTDIR")
+    p.set_defaults(func=cmd_import)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return args.func(args)
+    except CliError as exc:
+        print(f"showcase-deck: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("showcase-deck: interrupted", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
